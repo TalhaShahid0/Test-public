@@ -1,42 +1,62 @@
 WITH cohort_notes AS (
     SELECT /*+ MATERIALIZE */ DISTINCT
-           TBL.PERSON_ID,
-           PT.PAT_MRN_ID,
-           HN.PAT_ENC_CSN_ID,
-           HN.NOTE_ID
+           PT.PAT_MRN_ID       AS MRN,
+           TBL.PERSON_ID       AS PERSON_ID,
+           ENC.PAT_ENC_CSN_ID  AS CSN,
+           HN.NOTE_ID          AS NOTE_ID
     FROM   TBL_PERSON_ID_1585 TBL
-    JOIN   CLARITY.PATIENT  PT  ON PT.PAT_ID = TBL.PAT_ID
-    JOIN   CLARITY.PAT_ENC  ENC ON ENC.PAT_ID = PT.PAT_ID
+    JOIN   CLARITY.PATIENT  PT  ON PT.PAT_ID         = TBL.PAT_ID
+    JOIN   CLARITY.PAT_ENC  ENC ON ENC.PAT_ID        = PT.PAT_ID
     JOIN   CLARITY.HNO_INFO HN  ON HN.PAT_ENC_CSN_ID = ENC.PAT_ENC_CSN_ID
 ),
-sp_notes AS (
-    SELECT DISTINCT S.NOTE_ID
+sp_notes AS (                       -- cohort notes that hit a smartphrase
+    SELECT /*+ MATERIALIZE */ DISTINCT S.NOTE_ID
     FROM   CLARITY.NOTE_SMARTPHRASE_IDS S
     WHERE  S.SMARTPHRASES_ID IN (592203,592204,481086,573124)
-    AND    EXISTS (SELECT 1 FROM cohort_notes C WHERE C.NOTE_ID = S.NOTE_ID)
+    AND    S.NOTE_ID IN (SELECT NOTE_ID FROM cohort_notes)
 ),
-qualifying_lines AS (
-    SELECT T.NOTE_ID, T.CONTACT_DATE, T.CONTACT_DATE_REAL, T.LINE, T.NOTE_TEXT,
-           RANK() OVER (PARTITION BY T.NOTE_ID
-                        ORDER BY T.CONTACT_DATE_REAL DESC) RN
+other_notes AS (                    -- cohort notes that do not
+    SELECT /*+ MATERIALIZE */ NOTE_ID FROM (
+        SELECT DISTINCT NOTE_ID FROM cohort_notes
+        MINUS
+        SELECT NOTE_ID FROM sp_notes )
+),
+note_authors AS (                   -- NOTE_ID-only join, exactly as in the original
+    SELECT /*+ MATERIALIZE */ DISTINCT
+           HNO.NOTE_ID, EMP.NAME AS AUTHOR_NAME
+    FROM   CLARITY.NOTE_ENC_INFO HNO
+    LEFT   JOIN CLARITY.CLARITY_EMP EMP ON EMP.USER_ID = HNO.AUTHOR_USER_ID
+    WHERE  HNO.NOTE_ID IN (SELECT NOTE_ID FROM cohort_notes)
+),
+raw_lines AS (
+    SELECT T.NOTE_ID, T.CONTACT_DATE, T.CONTACT_DATE_REAL, T.LINE, T.NOTE_TEXT
     FROM   CLARITY.HNO_NOTE_TEXT T
-    WHERE  T.NOTE_ID IN (SELECT NOTE_ID FROM cohort_notes)
+    WHERE  T.NOTE_ID IN (SELECT NOTE_ID FROM sp_notes)
     AND    T.CONTACT_DATE >= TO_DATE('06/15/2026','mm/dd/yyyy')
     AND    T.CONTACT_DATE <= TO_DATE('06/30/2026','mm/dd/yyyy')
-    AND    (   EXISTS (SELECT 1 FROM sp_notes S WHERE S.NOTE_ID = T.NOTE_ID)
-            OR UPPER(T.NOTE_TEXT) LIKE '%BIRT%' )
+    UNION ALL
+    SELECT T.NOTE_ID, T.CONTACT_DATE, T.CONTACT_DATE_REAL, T.LINE, T.NOTE_TEXT
+    FROM   CLARITY.HNO_NOTE_TEXT T
+    WHERE  T.NOTE_ID IN (SELECT NOTE_ID FROM other_notes)
+    AND    T.CONTACT_DATE >= TO_DATE('06/15/2026','mm/dd/yyyy')
+    AND    T.CONTACT_DATE <= TO_DATE('06/30/2026','mm/dd/yyyy')
+    AND    UPPER(T.NOTE_TEXT) LIKE '%BIRT%'
+),
+ranked AS (
+    SELECT R.*,
+           RANK() OVER (PARTITION BY R.NOTE_ID
+                        ORDER BY R.CONTACT_DATE_REAL DESC) RN
+    FROM   raw_lines R
 )
-SELECT C.PAT_MRN_ID      "mrn",
-       C.PERSON_ID       "personid",
-       C.PAT_ENC_CSN_ID  "encounter_id",
-       EMP.NAME          "author_name",
-       Q.CONTACT_DATE    "interviewdate",
-       Q.LINE            "line",
-       Q.NOTE_TEXT       "note_text"
-FROM       qualifying_lines        Q
-JOIN       cohort_notes            C   ON C.NOTE_ID = Q.NOTE_ID
-JOIN       CLARITY.NOTE_ENC_INFO   HNO ON HNO.NOTE_ID           = Q.NOTE_ID
-                                      AND HNO.CONTACT_DATE_REAL = Q.CONTACT_DATE_REAL
-LEFT JOIN  CLARITY.CLARITY_EMP     EMP ON EMP.USER_ID = HNO.AUTHOR_USER_ID
-WHERE  Q.RN = 1
+SELECT C.MRN          "mrn",
+       C.PERSON_ID    "personid",
+       C.CSN          "encounter_id",
+       A.AUTHOR_NAME  "author_name",
+       L.CONTACT_DATE "interviewdate",
+       L.LINE         "line",
+       L.NOTE_TEXT    "note_text"
+FROM   ranked       L
+JOIN   cohort_notes C ON C.NOTE_ID = L.NOTE_ID
+JOIN   note_authors A ON A.NOTE_ID = L.NOTE_ID
+WHERE  L.RN = 1
 ORDER  BY "mrn", "encounter_id", "line";
