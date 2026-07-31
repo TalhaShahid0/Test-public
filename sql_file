@@ -1,62 +1,83 @@
-WITH cohort_notes AS (
-    SELECT /*+ MATERIALIZE */ DISTINCT
-           PT.PAT_MRN_ID       AS MRN,
-           TBL.PERSON_ID       AS PERSON_ID,
-           ENC.PAT_ENC_CSN_ID  AS CSN,
-           HN.NOTE_ID          AS NOTE_ID
-    FROM   TBL_PERSON_ID_1585 TBL
-    JOIN   CLARITY.PATIENT  PT  ON PT.PAT_ID         = TBL.PAT_ID
-    JOIN   CLARITY.PAT_ENC  ENC ON ENC.PAT_ID        = PT.PAT_ID
-    JOIN   CLARITY.HNO_INFO HN  ON HN.PAT_ENC_CSN_ID = ENC.PAT_ENC_CSN_ID
+WITH 
+-- Step 1: Get eligible patients (small set)
+eligible_patients AS (
+    SELECT /*+ MATERIALIZE */
+        PAT_ID, PERSON_ID
+    FROM TBL_PERSON_ID_1585
 ),
-sp_notes AS (                       -- cohort notes that hit a smartphrase
-    SELECT /*+ MATERIALIZE */ DISTINCT S.NOTE_ID
-    FROM   CLARITY.NOTE_SMARTPHRASE_IDS S
-    WHERE  S.SMARTPHRASES_ID IN (592203,592204,481086,573124)
-    AND    S.NOTE_ID IN (SELECT NOTE_ID FROM cohort_notes)
+
+-- Step 2: Pre-filter notes by date (most selective filter)
+notes_date_range AS (
+    SELECT /*+ MATERIALIZE PARALLEL(8) */
+        NOTE_ID,
+        CONTACT_DATE,
+        CONTACT_DATE_REAL,
+        LINE,
+        NOTE_TEXT,
+        CASE 
+            WHEN UPPER(NOTE_TEXT) LIKE '%BIRT%' THEN 1 
+            ELSE 0 
+        END AS has_birt_flag
+    FROM CLARITY.HNO_NOTE_TEXT
+    WHERE CONTACT_DATE >= DATE '2026-06-15'
+      AND CONTACT_DATE <= DATE '2026-06-30'
 ),
-other_notes AS (                    -- cohort notes that do not
-    SELECT /*+ MATERIALIZE */ NOTE_ID FROM (
-        SELECT DISTINCT NOTE_ID FROM cohort_notes
-        MINUS
-        SELECT NOTE_ID FROM sp_notes )
+
+-- Step 3: Get notes meeting criteria (smartphrase OR BIRT text)
+qualified_note_ids AS (
+    SELECT /*+ MATERIALIZE */
+        NOTE_ID
+    FROM (
+        SELECT NOTE_ID 
+        FROM CLARITY.NOTE_SMARTPHRASE_IDS
+        WHERE SMARTPHRASES_ID IN (592203, 592204, 481086, 573124)
+        UNION ALL
+        SELECT NOTE_ID
+        FROM notes_date_range
+        WHERE has_birt_flag = 1
+    )
+    GROUP BY NOTE_ID
 ),
-note_authors AS (                   -- NOTE_ID-only join, exactly as in the original
-    SELECT /*+ MATERIALIZE */ DISTINCT
-           HNO.NOTE_ID, EMP.NAME AS AUTHOR_NAME
-    FROM   CLARITY.NOTE_ENC_INFO HNO
-    LEFT   JOIN CLARITY.CLARITY_EMP EMP ON EMP.USER_ID = HNO.AUTHOR_USER_ID
-    WHERE  HNO.NOTE_ID IN (SELECT NOTE_ID FROM cohort_notes)
-),
-raw_lines AS (
-    SELECT T.NOTE_ID, T.CONTACT_DATE, T.CONTACT_DATE_REAL, T.LINE, T.NOTE_TEXT
-    FROM   CLARITY.HNO_NOTE_TEXT T
-    WHERE  T.NOTE_ID IN (SELECT NOTE_ID FROM sp_notes)
-    AND    T.CONTACT_DATE >= TO_DATE('06/15/2026','mm/dd/yyyy')
-    AND    T.CONTACT_DATE <= TO_DATE('06/30/2026','mm/dd/yyyy')
-    UNION ALL
-    SELECT T.NOTE_ID, T.CONTACT_DATE, T.CONTACT_DATE_REAL, T.LINE, T.NOTE_TEXT
-    FROM   CLARITY.HNO_NOTE_TEXT T
-    WHERE  T.NOTE_ID IN (SELECT NOTE_ID FROM other_notes)
-    AND    T.CONTACT_DATE >= TO_DATE('06/15/2026','mm/dd/yyyy')
-    AND    T.CONTACT_DATE <= TO_DATE('06/30/2026','mm/dd/yyyy')
-    AND    UPPER(T.NOTE_TEXT) LIKE '%BIRT%'
-),
-ranked AS (
-    SELECT R.*,
-           RANK() OVER (PARTITION BY R.NOTE_ID
-                        ORDER BY R.CONTACT_DATE_REAL DESC) RN
-    FROM   raw_lines R
+
+-- Step 4: Combine all data with minimal joins
+final_result AS (
+    SELECT /*+ PARALLEL(4) */
+        PT.PAT_MRN_ID AS mrn,
+        EP.PERSON_ID AS personid,
+        ENC.PAT_ENC_CSN_ID AS encounter_id,
+        EMP.NAME AS author_name,
+        NDR.CONTACT_DATE AS interviewdate,
+        NDR.LINE,
+        NDR.NOTE_TEXT,
+        ROW_NUMBER() OVER (
+            PARTITION BY NDR.NOTE_ID 
+            ORDER BY NDR.CONTACT_DATE_REAL DESC
+        ) AS rn
+    FROM qualified_note_ids QNI
+    INNER JOIN notes_date_range NDR
+        ON QNI.NOTE_ID = NDR.NOTE_ID
+    INNER JOIN CLARITY.HNO_INFO HN
+        ON NDR.NOTE_ID = HN.NOTE_ID
+    INNER JOIN CLARITY.PAT_ENC ENC
+        ON HN.PAT_ENC_CSN_ID = ENC.PAT_ENC_CSN_ID
+    INNER JOIN eligible_patients EP
+        ON ENC.PAT_ID = EP.PAT_ID
+    INNER JOIN CLARITY.PATIENT PT
+        ON EP.PAT_ID = PT.PAT_ID
+    LEFT JOIN CLARITY.NOTE_ENC_INFO HNO
+        ON NDR.NOTE_ID = HNO.NOTE_ID
+    LEFT JOIN CLARITY.CLARITY_EMP EMP
+        ON HNO.AUTHOR_USER_ID = EMP.USER_ID
 )
-SELECT C.MRN          "mrn",
-       C.PERSON_ID    "personid",
-       C.CSN          "encounter_id",
-       A.AUTHOR_NAME  "author_name",
-       L.CONTACT_DATE "interviewdate",
-       L.LINE         "line",
-       L.NOTE_TEXT    "note_text"
-FROM   ranked       L
-JOIN   cohort_notes C ON C.NOTE_ID = L.NOTE_ID
-JOIN   note_authors A ON A.NOTE_ID = L.NOTE_ID
-WHERE  L.RN = 1
-ORDER  BY "mrn", "encounter_id", "line";
+
+SELECT 
+    mrn,
+    personid,
+    encounter_id,
+    author_name,
+    interviewdate,
+    line,
+    note_text
+FROM final_result
+WHERE rn = 1
+ORDER BY mrn, encounter_id, line;
