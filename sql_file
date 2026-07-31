@@ -1,1 +1,46 @@
---code here ok
+WITH note_lines AS (
+    SELECT NOTE_ID, CONTACT_DATE, CONTACT_DATE_REAL, LINE, NOTE_TEXT
+    FROM   CLARITY.HNO_NOTE_TEXT
+    WHERE  CONTACT_DATE >= TO_DATE('06/15/2026','mm/dd/yyyy')
+    AND    CONTACT_DATE <= TO_DATE('06/30/2026','mm/dd/yyyy')
+),
+sp_notes AS (
+    SELECT DISTINCT NOTE_ID
+    FROM   CLARITY.NOTE_SMARTPHRASE_IDS
+    WHERE  SMARTPHRASES_ID IN (592203,592204,481086,573124)
+),
+kept_lines AS (
+    -- notes matched by smartphrase: keep every line
+    SELECT NL.*
+    FROM   note_lines NL
+    WHERE  EXISTS (SELECT 1 FROM sp_notes S WHERE S.NOTE_ID = NL.NOTE_ID)
+    UNION ALL
+    -- notes not matched by smartphrase: keep only lines containing BIRT
+    SELECT NL.*
+    FROM   note_lines NL
+    WHERE  NOT EXISTS (SELECT 1 FROM sp_notes S WHERE S.NOTE_ID = NL.NOTE_ID)
+    AND    UPPER(NL.NOTE_TEXT) LIKE '%BIRT%'
+),
+ranked AS (
+    SELECT DISTINCT
+           PT.PAT_MRN_ID        "mrn",
+           TBL.PERSON_ID        "personid",
+           ENC.PAT_ENC_CSN_ID   "encounter_id",
+           EMP.NAME             "author_name",
+           HNT.CONTACT_DATE     "interviewdate",
+           HNT.LINE             "line",
+           HNT.NOTE_TEXT        "note_text",
+           RANK() OVER (PARTITION BY HNT.NOTE_ID
+                        ORDER BY HNT.CONTACT_DATE_REAL DESC) RN
+    FROM       TBL_PERSON_ID_1585 TBL
+    JOIN       CLARITY.PATIENT       PT  ON PT.PAT_ID  = TBL.PAT_ID
+    JOIN       CLARITY.PAT_ENC       ENC ON ENC.PAT_ID = PT.PAT_ID
+    JOIN       CLARITY.HNO_INFO      HN  ON HN.PAT_ENC_CSN_ID = ENC.PAT_ENC_CSN_ID
+    JOIN       CLARITY.NOTE_ENC_INFO HNO ON HNO.NOTE_ID = HN.NOTE_ID
+    JOIN       kept_lines            HNT ON HNT.NOTE_ID = HNO.NOTE_ID
+    LEFT JOIN  CLARITY.CLARITY_EMP   EMP ON EMP.USER_ID = HNO.AUTHOR_USER_ID
+)
+SELECT "mrn","personid","encounter_id","author_name","interviewdate","line","note_text"
+FROM   ranked
+WHERE  RN = 1
+ORDER  BY "mrn","encounter_id","line";
