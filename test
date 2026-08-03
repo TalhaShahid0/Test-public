@@ -1,66 +1,55 @@
-WITH note_dates AS
-(
-SELECT
-NOTE_ID,
-CONTACT_DATE,
-CONTACT_DATE_REAL,
-LINE,
-NOTE_TEXT
-FROM CLARITY.HNO_NOTE_TEXT
-WHERE CONTACT_DATE >= DATE '2026-06-15'
-AND CONTACT_DATE < DATE '2026-07-01'
+WITH cohort_notes AS (
+    SELECT PT.PAT_MRN_ID AS mrn,
+           TBL.PERSON_ID AS personid,
+           ENC.PAT_ENC_CSN_ID AS encounter_id,
+           HN.NOTE_ID,
+           HNO.AUTHOR_USER_ID
+    FROM TBL_PERSON_ID_1585 TBL
+    JOIN CLARITY.PATIENT PT ON PT.PAT_ID = TBL.PAT_ID
+    JOIN CLARITY.PAT_ENC ENC ON ENC.PAT_ID = PT.PAT_ID
+    JOIN CLARITY.HNO_INFO HN ON HN.PAT_ENC_CSN_ID = ENC.PAT_ENC_CSN_ID
+    JOIN CLARITY.NOTE_ENC_INFO HNO
+        ON HNO.NOTE_ID = HN.NOTE_ID
+    --  AND HNO.SENSITIVE_STAT_C = 1   -- left commented, as in original
 ),
-smartphrase_notes AS
-(
-SELECT DISTINCT
-NOTE_ID
-FROM CLARITY.NOTE_SMARTPHRASE_IDS
-WHERE SMARTPHRASES_ID IN (592203, 592204, 481086, 573124)
+note_dates AS (
+    SELECT NT.NOTE_ID, NT.CONTACT_DATE, NT.CONTACT_DATE_REAL, NT.LINE, NT.NOTE_TEXT
+    FROM CLARITY.HNO_NOTE_TEXT NT
+    JOIN cohort_notes CN ON CN.NOTE_ID = NT.NOTE_ID   -- cohort narrows this scan
+    WHERE NT.CONTACT_DATE BETWEEN TO_DATE('2026-06-15','yyyy-mm-dd')
+                               AND TO_DATE('2026-06-30','yyyy-mm-dd')
 ),
-ranked AS
-(
-SELECT DISTINCT
-PT.PAT_MRN_ID AS "mrn",
-TBL.PERSON_ID AS "personid",
-ENC.PAT_ENC_CSN_ID AS "encounter_id",
-EMP.NAME AS "author_name",
-HNT.CONTACT_DATE AS "interviewdate",
-HNT.LINE AS "line",
-HNT.NOTE_TEXT AS "note_text",
-RANK() OVER
-(
-PARTITION BY HNT.NOTE_ID
-ORDER BY HNT.CONTACT_DATE_REAL DESC
-) AS RN
-FROM TBL_PERSON_ID_1585 TBL
-JOIN CLARITY.PATIENT PT
-ON PT.PAT_ID = TBL.PAT_ID
-JOIN CLARITY.PAT_ENC ENC
-ON ENC.PAT_ID = PT.PAT_ID
-JOIN CLARITY.HNO_INFO HN
-ON HN.PAT_ENC_CSN_ID = ENC.PAT_ENC_CSN_ID
-JOIN CLARITY.NOTE_ENC_INFO HNO
-ON HNO.NOTE_ID = HN.NOTE_ID
-JOIN note_dates HNT
-ON HNT.NOTE_ID = HNO.NOTE_ID
-LEFT JOIN smartphrase_notes SMRT
-ON SMRT.NOTE_ID = HNO.NOTE_ID
-LEFT JOIN CLARITY.CLARITY_EMP EMP
-ON EMP.USER_ID = HNO.AUTHOR_USER_ID
-WHERE SMRT.NOTE_ID IS NOT NULL
-OR UPPER(HNT.NOTE_TEXT) LIKE '%BIRT%'
+smartphrase_notes AS (
+    SELECT DISTINCT NOTE_ID
+    FROM CLARITY.NOTE_SMARTPHRASE_IDS
+    WHERE SMARTPHRASES_ID IN (592203,592204,481086,573124)
+      AND NOTE_ID IN (SELECT NOTE_ID FROM note_dates)   -- narrowed before the LIKE scan
+),
+matched_lines AS (
+    SELECT ND.*
+    FROM note_dates ND
+    LEFT JOIN smartphrase_notes SP ON SP.NOTE_ID = ND.NOTE_ID
+    WHERE SP.NOTE_ID IS NOT NULL
+       OR UPPER(ND.NOTE_TEXT) LIKE '%BIRT%'
+),
+ranked AS (
+    SELECT DISTINCT
+           CN.mrn,
+           CN.personid,
+           CN.encounter_id,
+           EMP.NAME              AS author_name,
+           ML.CONTACT_DATE       AS interviewdate,
+           ML.LINE               AS line,
+           ML.NOTE_TEXT          AS note_text,
+           RANK() OVER (
+               PARTITION BY ML.NOTE_ID
+               ORDER BY ML.CONTACT_DATE_REAL DESC
+           ) AS rn
+    FROM matched_lines ML
+    JOIN cohort_notes CN ON CN.NOTE_ID = ML.NOTE_ID
+    LEFT JOIN CLARITY.CLARITY_EMP EMP ON EMP.USER_ID = CN.AUTHOR_USER_ID
 )
-SELECT
-"mrn",
-"personid",
-"encounter_id",
-"author_name",
-"interviewdate",
-"line",
-"note_text"
+SELECT mrn, personid, encounter_id, author_name, interviewdate, line, note_text
 FROM ranked
-WHERE RN = 1
-ORDER BY
-"mrn",
-"encounter_id",
-"line";
+WHERE rn = 1
+ORDER BY mrn, encounter_id, line;
