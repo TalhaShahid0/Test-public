@@ -1,0 +1,8 @@
+SELECT execution_id, status, start_time, end_time, 
+       process_id, server_name, machine_name
+FROM catalog.executions 
+WHERE execution_id = 29591;
+
+SELECT * FROM catalog.operation_messages 
+WHERE operation_id = 29591 
+ORDER BY message_time DESC;
