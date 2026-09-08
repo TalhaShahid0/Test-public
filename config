@@ -1,1 +1,70 @@
+pipeline_configs = [
+    {
+        "pipeline_name": "TBL_ALLERGY_PTT_MEDHX",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PTT_MEDHX",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
 
+        "source_query": """
+            SELECT DISTINCT
+                PAT.PAT_MRN_ID                        AS PAT_MRN_ID,
+                PAT.PAT_ID                            AS PAT_ID,
+                PAT.PAT_NAME                          AS PAT_NAME,
+                HX.LINE                               AS LINE,
+                HX.CONTACT_DATE                       AS HX_CONTACT_DATE,
+                HX.DX_ID                              AS DX_ID,
+                G.DX_NAME                             AS DX_NAME,
+                G.CURRENT_ICD9_LIST                   AS ICD9_CODE,
+                HX.MEDICAL_HX_DATE                    AS MEDICAL_HX_DATE,
+                HX.COMMENTS                           AS COMMENTS,
+                ZH.NAME                               AS HISTORYSOURCE_1,
+                CAST(NULL AS STRING)                  AS HISTORYSOURCE_2,
+                CAST(HX.MED_HX_ANNOTATION AS STRING)  AS MED_HX_ANNOTATION,
+                HX.HX_LNK_ENC_CSN                     AS HX_LNK_ENC_CSN,
+                E.PAT_ENC_CSN_ID                      AS PAT_ENC_CSN_ID,
+                HX.ENC_ICD_CODE                       AS ENC_ICD_CODE,
+                E.DEPARTMENT_ID                       AS DEPARTMENT_ID,
+                DEP.DEPARTMENT_NAME                   AS DEPARTMENT_NAME
+            FROM CLARITY_LH.CLARITY.MEDICAL_HX HX
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC E
+                ON HX.HX_LNK_ENC_CSN = E.PAT_ENC_CSN_ID
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PAT
+                ON PAT.PAT_ID = E.PAT_ID
+            -- TBL_PAT_ID is loaded by this same framework, so it is append-only
+            -- with soft deletes: it holds every historical version plus rows
+            -- flagged IS_DELETED = 1. Joining it raw multiplies each encounter
+            -- by the number of stored versions AND keeps patients who have been
+            -- soft-deleted out of the source. Reduce to latest-active first.
+            INNER JOIN (
+                SELECT PAT_ID FROM (
+                    SELECT PAT_ID, IS_DELETED,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ROW_HASH
+                               ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC
+                           ) AS rn
+                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID
+                ) WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
+                GROUP BY PAT_ID
+            ) MVP ON MVP.PAT_ID = E.PAT_ID
+            LEFT OUTER JOIN CLARITY_LH.CLARITY.CLARITY_EDG G
+                ON G.DX_ID = HX.DX_ID
+            LEFT OUTER JOIN CLARITY_LH.CLARITY.ZC_HISTORY_SOURCE ZH
+                ON ZH.HISTORY_SOURCE_C = HX.MED_HX_SOURCE_C
+            LEFT OUTER JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                ON DEP.DEPARTMENT_ID = E.DEPARTMENT_ID
+        """,
+
+        # Empty = full-row-hash change detection. Grain is the row version.
+        "primary_keys": "",
+
+        "non_key_columns": (
+            "PAT_MRN_ID, PAT_ID, PAT_NAME, LINE, HX_CONTACT_DATE, "
+            "DX_ID, DX_NAME, ICD9_CODE, MEDICAL_HX_DATE, COMMENTS, "
+            "HISTORYSOURCE_1, HISTORYSOURCE_2, MED_HX_ANNOTATION, "
+            "HX_LNK_ENC_CSN, PAT_ENC_CSN_ID, ENC_ICD_CODE, "
+            "DEPARTMENT_ID, DEPARTMENT_NAME"
+        ),
+
+        "identity_column": "ALLERGY_PTT_MEDHX_KEY",
+        "load_type": "FULL",
+    },
+]
