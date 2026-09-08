@@ -4,3 +4,11 @@ SELECT execution_id, status, start_time, end_time,
 FROM catalog.executions
 WHERE package_name = 'Forward_Files.dtsx'
 ORDER BY start_time DESC;
+
+
+
+USE SSISDB;
+SELECT message_time, message_type, message
+FROM catalog.operation_messages
+WHERE operation_id = 29590
+ORDER BY message_time;
