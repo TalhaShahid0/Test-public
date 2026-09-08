@@ -1,8 +1,6 @@
-SELECT execution_id, status, start_time, end_time, 
-       process_id, server_name, machine_name
-FROM catalog.executions 
-WHERE execution_id = 29591;
-
-SELECT * FROM catalog.operation_messages 
-WHERE operation_id = 29591 
-ORDER BY message_time DESC;
+USE SSISDB;
+SELECT execution_id, status, start_time, end_time,
+       DATEDIFF(SECOND, start_time, end_time) AS secs
+FROM catalog.executions
+WHERE package_name = 'Forward_Files.dtsx'
+ORDER BY start_time DESC;
