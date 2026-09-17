@@ -64,3 +64,44 @@ pipeline_configs = [
         "load_type": "FULL",
     }
 ]
+
+
+
+
+
+
+pipeline_configs = [
+    {
+        "pipeline_name": "TBL_LAB_RESULT_COMMENTS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_RESULT_COMMENTS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            SELECT pp.order_proc_id,
+                   pp.component_id,
+                   pp.line,
+                   REGEXP_REPLACE(
+                       CONCAT_WS(' ',
+                           TRANSFORM(
+                               SORT_ARRAY(
+                                   COLLECT_LIST(STRUCT(rc.line_comment AS ord, rc.results_comp_cmt AS txt))
+                               ),
+                               x -> x.txt
+                           )
+                       ),
+                       '<[/]?A>',
+                       ''
+                   ) AS result_text
+            FROM   mv_allergy_labs_pop pp
+                   INNER JOIN clarity_lh.clarity.order_res_comp_cmt rc
+                           ON pp.order_proc_id = rc.order_id
+                          AND pp.component_id = rc.component_id
+                          AND pp.line = rc.line_comp
+            WHERE  rc.results_comp_cmt <> 'This result contains rich text formatting which cannot be displayed here.'
+            GROUP BY pp.order_proc_id, pp.component_id, pp.line
+        """,
+        "primary_keys": "",
+        "non_key_columns": "RESULT_TEXT",
+        "identity_column": "ORDER_PROC_ID",
+        "load_type": "FULL",
+    }
+]
