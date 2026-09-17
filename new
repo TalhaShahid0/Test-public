@@ -1,44 +1,54 @@
 pipeline_configs = [
     {
-        "pipeline_name": "TBL_LAB_RESULT_MULTILINE_VALUES",
-        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_RESULT_MULTILINE_VALUES",
+        "pipeline_name": "TBL_LAB_ORDERS_RESULTS_FINAL",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_ORDERS_RESULTS_FINAL",
         "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
         "source_query": """
-            SELECT rdb.res_order_id                          AS order_proc_id,
-                   rc.component_id,
-                   COALESCE(cc.external_name, cc.name)       AS componentname,
-                   REGEXP_REPLACE(
-                       CONCAT_WS(' ',
-                           TRANSFORM(
-                               SORT_ARRAY(
-                                   COLLECT_LIST(STRUCT(dta.group_line AS grp, dta.value_line AS val, dta.mult_ln_val_storage AS txt))
-                               ),
-                               x -> x.txt
-                           )
-                       ),
-                       '<[/]?A>',
-                       ''
-                   ) AS result_text
-            FROM   mv_allergy_labs_pop pp
-                   INNER JOIN clarity_lh.clarity.res_db_main rdb
-                           ON pp.order_proc_id = rdb.res_order_id
-                   INNER JOIN clarity_lh.clarity.res_components rc
-                           ON rdb.result_id = rc.result_id
-                          AND pp.component_id = rc.component_id
-                   INNER JOIN clarity_lh.clarity.clarity_component cc
-                           ON rc.component_id = cc.component_id
-                   INNER JOIN clarity_lh.clarity.res_val_ptr_rm ptr
-                           ON rc.result_id = ptr.result_id
-                          AND rc.line = ptr.group_line
-                   INNER JOIN clarity_lh.clarity.res_val_data_rm dta
-                           ON ptr.result_id = dta.result_id
-                          AND ptr.cmp_multiline_value = dta.group_line
-            GROUP BY rdb.res_order_id,
-                     rc.component_id,
-                     COALESCE(cc.external_name, cc.name)
+            SELECT pop.pat_mrn_id,
+                   pop.pat_id,
+                   pop.pat_enc_csn_id,
+                   pop.appt_status_c,
+                   pop.appt_prc_id,
+                   pop.enc_type_title,
+                   pop.contact_date,
+                   pop.department_name,
+                   pop.order_proc_id,
+                   pop.proc_code,
+                   pop.description,
+                   pop.ordering_date,
+                   pop.result_time,
+                   pop.result_date,
+                   pop.component_id,
+                   COALESCE(path_r.componentname, pop.componentname)   AS componentname,
+                   pop.ord_value,
+                   pop.ord_num_value,
+                   COALESCE(path_r.result_text, tst_r.result_text)     AS result_text,
+                   pop.reference_unit,
+                   pop.reference_low,
+                   pop.reference_high,
+                   pop.result_flag,
+                   pop.lab_status_c,
+                   CASE
+                       WHEN pop.lab_status_c = 3 THEN 'Final Result'
+                       WHEN pop.lab_status_c = 4 THEN 'Edited'
+                   END                                                  AS lab_status,
+                   pop.resultstatus,
+                   pop.enc_closed_yn,
+                   pop.ord_date_real,
+                   pop.ord_end_date_real,
+                   pop.line,
+                   pop.department_id
+            FROM   mv_allergy_labs_pop pop
+                   LEFT OUTER JOIN mv_allergy_labs_results tst_r
+                           ON pop.order_proc_id = tst_r.order_proc_id
+                          AND pop.component_id = tst_r.component_id
+                          AND pop.line = tst_r.line
+                   LEFT OUTER JOIN mv_allergy_labs_pathology path_r
+                           ON pop.order_proc_id = path_r.order_proc_id
+                          AND pop.component_id = path_r.component_id
         """,
         "primary_keys": "",
-        "non_key_columns": "COMPONENTNAME, RESULT_TEXT",
+        "non_key_columns": "PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_STATUS_C, APPT_PRC_ID, ENC_TYPE_TITLE, CONTACT_DATE, DEPARTMENT_NAME, ORDER_PROC_ID, PROC_CODE, DESCRIPTION, ORDERING_DATE, RESULT_TIME, RESULT_DATE, COMPONENT_ID, COMPONENTNAME, ORD_VALUE, ORD_NUM_VALUE, RESULT_TEXT, REFERENCE_UNIT, REFERENCE_LOW, REFERENCE_HIGH, RESULT_FLAG, LAB_STATUS_C, LAB_STATUS, RESULTSTATUS, ENC_CLOSED_YN, ORD_DATE_REAL, ORD_END_DATE_REAL, LINE, DEPARTMENT_ID",
         "identity_column": "ORDER_PROC_ID",
         "load_type": "FULL",
     }
