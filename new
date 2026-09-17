@@ -1,14 +1,66 @@
-USE SSISDB;
-SELECT execution_id, status, start_time, end_time,
-       DATEDIFF(SECOND, start_time, end_time) AS secs
-FROM catalog.executions
-WHERE package_name = 'Forward_Files.dtsx'
-ORDER BY start_time DESC;
-
-
-
-USE SSISDB;
-SELECT message_time, message_type, message
-FROM catalog.operation_messages
-WHERE operation_id = 29590
-ORDER BY message_time;
+pipeline_configs = [
+    {
+        "pipeline_name": "TBL_LAB_ORDERS_RESULTS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_ORDERS_RESULTS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            SELECT pat.pat_mrn_id          AS pat_mrn_id,
+                   pe.pat_id               AS pat_id,
+                   pe.pat_enc_csn_id       AS pat_enc_csn_id,
+                   pe.appt_status_c        AS appt_status_c,
+                   pe.appt_prc_id          AS appt_prc_id,
+                   zdet.name               AS enc_type_title,
+                   pe.contact_date         AS contact_date,
+                   d.department_name       AS department_name,
+                   op.order_proc_id        AS order_proc_id,
+                   op.proc_code            AS proc_code,
+                   op.description          AS description,
+                   op.ordering_date        AS ordering_date,
+                   r.result_time           AS result_time,
+                   r.result_date           AS result_date,
+                   r.component_id          AS component_id,
+                   cc.name                 AS componentname,
+                   r.ord_value             AS ord_value,
+                   r.ord_num_value         AS ord_num_value,
+                   r.reference_unit        AS reference_unit,
+                   r.reference_low         AS reference_low,
+                   r.reference_high        AS reference_high,
+                   zrf.name                AS result_flag,
+                   r.lab_status_c          AS lab_status_c,
+                   CASE
+                       WHEN r.lab_status_c = 3 THEN 'Final Result'
+                       WHEN r.lab_status_c = 4 THEN 'Edited'
+                   END                     AS lab_status,
+                   rs.name                 AS resultstatus,
+                   pe.enc_closed_yn        AS enc_closed_yn,
+                   r.ord_date_real         AS ord_date_real,
+                   r.ord_end_date_real     AS ord_end_date_real,
+                   r.line,
+                   pe.department_id        AS department_id
+            FROM   allergy_lh.allergy.mv_pat_id mvp
+                   INNER JOIN clarity_lh.clarity.pat_enc pe
+                       ON mvp.pat_id = pe.pat_id
+                   INNER JOIN clarity_lh.clarity.patient pat
+                       ON pe.pat_id = pat.pat_id
+                   INNER JOIN clarity_lh.clarity.order_proc op
+                       ON pe.pat_enc_csn_id = op.pat_enc_csn_id
+                   LEFT OUTER JOIN clarity_lh.clarity.order_results r
+                       ON op.order_proc_id = r.order_proc_id
+                   LEFT OUTER JOIN clarity_lh.clarity.clarity_component cc
+                       ON r.component_id = cc.component_id
+                   LEFT OUTER JOIN clarity_lh.clarity.zc_result_status rs
+                       ON r.result_status_c = rs.result_status_c
+                   LEFT OUTER JOIN clarity_lh.clarity.clarity_dep d
+                       ON pe.department_id = d.department_id
+                   LEFT OUTER JOIN clarity_lh.clarity.zc_result_flag zrf
+                       ON r.result_flag_c = zrf.result_flag_c
+                   INNER JOIN clarity_lh.clarity.zc_disp_enc_type zdet
+                       ON pe.enc_type_c = zdet.disp_enc_type_c
+            WHERE  op.order_status_c IN (1, 2, 3, 5, 6, 9, 10, 11, 12)
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_STATUS_C, APPT_PRC_ID, ENC_TYPE_TITLE, CONTACT_DATE, DEPARTMENT_NAME, ORDER_PROC_ID, PROC_CODE, DESCRIPTION, ORDERING_DATE, RESULT_TIME, RESULT_DATE, COMPONENT_ID, COMPONENTNAME, ORD_VALUE, ORD_NUM_VALUE, REFERENCE_UNIT, REFERENCE_LOW, REFERENCE_HIGH, RESULT_FLAG, LAB_STATUS_C, LAB_STATUS, RESULTSTATUS, ENC_CLOSED_YN, ORD_DATE_REAL, ORD_END_DATE_REAL, LINE, DEPARTMENT_ID",
+        "identity_column": "ORDER_PROC_ID",
+        "load_type": "FULL",
+    }
+]
