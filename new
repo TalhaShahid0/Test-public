@@ -1,89 +1,17 @@
 pipeline_configs = [
     {
-        "pipeline_name": "TBL_LAB_ORDERS_RESULTS",
-        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_ORDERS_RESULTS",
+        "pipeline_name": "TBL_LAB_RESULT_MULTILINE_VALUES",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_RESULT_MULTILINE_VALUES",
         "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
         "source_query": """
-            SELECT pat.pat_mrn_id          AS pat_mrn_id,
-                   pe.pat_id               AS pat_id,
-                   pe.pat_enc_csn_id       AS pat_enc_csn_id,
-                   pe.appt_status_c        AS appt_status_c,
-                   pe.appt_prc_id          AS appt_prc_id,
-                   zdet.name               AS enc_type_title,
-                   pe.contact_date         AS contact_date,
-                   d.department_name       AS department_name,
-                   op.order_proc_id        AS order_proc_id,
-                   op.proc_code            AS proc_code,
-                   op.description          AS description,
-                   op.ordering_date        AS ordering_date,
-                   r.result_time           AS result_time,
-                   r.result_date           AS result_date,
-                   r.component_id          AS component_id,
-                   cc.name                 AS componentname,
-                   r.ord_value             AS ord_value,
-                   r.ord_num_value         AS ord_num_value,
-                   r.reference_unit        AS reference_unit,
-                   r.reference_low         AS reference_low,
-                   r.reference_high        AS reference_high,
-                   zrf.name                AS result_flag,
-                   r.lab_status_c          AS lab_status_c,
-                   CASE
-                       WHEN r.lab_status_c = 3 THEN 'Final Result'
-                       WHEN r.lab_status_c = 4 THEN 'Edited'
-                   END                     AS lab_status,
-                   rs.name                 AS resultstatus,
-                   pe.enc_closed_yn        AS enc_closed_yn,
-                   r.ord_date_real         AS ord_date_real,
-                   r.ord_end_date_real     AS ord_end_date_real,
-                   r.line,
-                   pe.department_id        AS department_id
-            FROM   allergy_lh.allergy.mv_pat_id mvp
-                   INNER JOIN clarity_lh.clarity.pat_enc pe
-                       ON mvp.pat_id = pe.pat_id
-                   INNER JOIN clarity_lh.clarity.patient pat
-                       ON pe.pat_id = pat.pat_id
-                   INNER JOIN clarity_lh.clarity.order_proc op
-                       ON pe.pat_enc_csn_id = op.pat_enc_csn_id
-                   LEFT OUTER JOIN clarity_lh.clarity.order_results r
-                       ON op.order_proc_id = r.order_proc_id
-                   LEFT OUTER JOIN clarity_lh.clarity.clarity_component cc
-                       ON r.component_id = cc.component_id
-                   LEFT OUTER JOIN clarity_lh.clarity.zc_result_status rs
-                       ON r.result_status_c = rs.result_status_c
-                   LEFT OUTER JOIN clarity_lh.clarity.clarity_dep d
-                       ON pe.department_id = d.department_id
-                   LEFT OUTER JOIN clarity_lh.clarity.zc_result_flag zrf
-                       ON r.result_flag_c = zrf.result_flag_c
-                   INNER JOIN clarity_lh.clarity.zc_disp_enc_type zdet
-                       ON pe.enc_type_c = zdet.disp_enc_type_c
-            WHERE  op.order_status_c IN (1, 2, 3, 5, 6, 9, 10, 11, 12)
-        """,
-        "primary_keys": "",
-        "non_key_columns": "PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_STATUS_C, APPT_PRC_ID, ENC_TYPE_TITLE, CONTACT_DATE, DEPARTMENT_NAME, ORDER_PROC_ID, PROC_CODE, DESCRIPTION, ORDERING_DATE, RESULT_TIME, RESULT_DATE, COMPONENT_ID, COMPONENTNAME, ORD_VALUE, ORD_NUM_VALUE, REFERENCE_UNIT, REFERENCE_LOW, REFERENCE_HIGH, RESULT_FLAG, LAB_STATUS_C, LAB_STATUS, RESULTSTATUS, ENC_CLOSED_YN, ORD_DATE_REAL, ORD_END_DATE_REAL, LINE, DEPARTMENT_ID",
-        "identity_column": "ORDER_PROC_ID",
-        "load_type": "FULL",
-    }
-]
-
-
-
-
-
-
-pipeline_configs = [
-    {
-        "pipeline_name": "TBL_LAB_RESULT_COMMENTS",
-        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_LAB_RESULT_COMMENTS",
-        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
-        "source_query": """
-            SELECT pp.order_proc_id,
-                   pp.component_id,
-                   pp.line,
+            SELECT rdb.res_order_id                          AS order_proc_id,
+                   rc.component_id,
+                   COALESCE(cc.external_name, cc.name)       AS componentname,
                    REGEXP_REPLACE(
                        CONCAT_WS(' ',
                            TRANSFORM(
                                SORT_ARRAY(
-                                   COLLECT_LIST(STRUCT(rc.line_comment AS ord, rc.results_comp_cmt AS txt))
+                                   COLLECT_LIST(STRUCT(dta.group_line AS grp, dta.value_line AS val, dta.mult_ln_val_storage AS txt))
                                ),
                                x -> x.txt
                            )
@@ -92,15 +20,25 @@ pipeline_configs = [
                        ''
                    ) AS result_text
             FROM   mv_allergy_labs_pop pp
-                   INNER JOIN clarity_lh.clarity.order_res_comp_cmt rc
-                           ON pp.order_proc_id = rc.order_id
+                   INNER JOIN clarity_lh.clarity.res_db_main rdb
+                           ON pp.order_proc_id = rdb.res_order_id
+                   INNER JOIN clarity_lh.clarity.res_components rc
+                           ON rdb.result_id = rc.result_id
                           AND pp.component_id = rc.component_id
-                          AND pp.line = rc.line_comp
-            WHERE  rc.results_comp_cmt <> 'This result contains rich text formatting which cannot be displayed here.'
-            GROUP BY pp.order_proc_id, pp.component_id, pp.line
+                   INNER JOIN clarity_lh.clarity.clarity_component cc
+                           ON rc.component_id = cc.component_id
+                   INNER JOIN clarity_lh.clarity.res_val_ptr_rm ptr
+                           ON rc.result_id = ptr.result_id
+                          AND rc.line = ptr.group_line
+                   INNER JOIN clarity_lh.clarity.res_val_data_rm dta
+                           ON ptr.result_id = dta.result_id
+                          AND ptr.cmp_multiline_value = dta.group_line
+            GROUP BY rdb.res_order_id,
+                     rc.component_id,
+                     COALESCE(cc.external_name, cc.name)
         """,
         "primary_keys": "",
-        "non_key_columns": "RESULT_TEXT",
+        "non_key_columns": "COMPONENTNAME, RESULT_TEXT",
         "identity_column": "ORDER_PROC_ID",
         "load_type": "FULL",
     }
