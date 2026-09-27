@@ -1,38 +1,39 @@
+# TBL_ALLERGY_SKINTEST -- same logic as the original query, only faster.
+# Original CTEs, SELECT list, all joins (incl. PATIENT) and DISTINCT are unchanged.
+# Only addition: NOTE_CONCEPT / NOTE_ENC_INFO / HNO_INFO / PAT_ENC are
+# pre-filtered (LEFT SEMI JOIN) to rows the original inner joins keep anyway,
+# and the missing ON for filtered_concepts is written out (nc.concept_id =
+# fc.concept_id, which the original already implied via cc and nc).
 pipeline_configs = [
     {
         "pipeline_name": "TBL_ALLERGY_SKINTEST",
         "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_SKINTEST",
         "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
         "source_query": """
-            WITH form_concepts AS (
-                -- one scan of SMARTFORM_CONCEPT instead of two
-                SELECT form_id,
-                       concept_id,
-                       contact_date_real,
-                       MAX(contact_date_real) OVER (PARTITION BY form_id) AS max_contact_date_real
+            WITH latest_form_date AS (
+                SELECT form_id, MAX(contact_date_real) AS max_contact_date_real
                 FROM CLARITY_LH.CLARITY.SMARTFORM_CONCEPT
                 WHERE form_id IN ('7','8','9','10','11','12','13','6','110')
-            ),
-            amb_concepts AS (
-                SELECT concept_id, name, abbreviation
-                FROM CLARITY_LH.CLARITY.CLARITY_CONCEPT
-                WHERE concept_id LIKE '%AMB%'
+                GROUP BY form_id
             ),
             filtered_concepts AS (
-                -- tiny: (form_id, concept_id) pairs on each form's latest version
-                SELECT /*+ BROADCAST(ac) */ DISTINCT fc.form_id, fc.concept_id
-                FROM form_concepts fc
-                LEFT SEMI JOIN amb_concepts ac
-                    ON fc.concept_id = ac.concept_id
-                WHERE fc.contact_date_real = fc.max_contact_date_real
+                SELECT sc.form_id, sc.concept_id
+                FROM CLARITY_LH.CLARITY.SMARTFORM_CONCEPT sc
+                INNER JOIN latest_form_date lfd
+                    ON sc.form_id = lfd.form_id
+                    AND sc.contact_date_real = lfd.max_contact_date_real
+                INNER JOIN CLARITY_LH.CLARITY.CLARITY_CONCEPT cc
+                    ON sc.concept_id = cc.concept_id
+                    AND cc.concept_id LIKE '%AMB%'
+                WHERE sc.form_id IN ('7','8','9','10','11','12','13','6','110')
             ),
+            -- ---- pruning only: these CTEs just pre-filter the big tables to rows that
+            -- ---- the original joins would keep anyway (semi join = inner join filter)
             concept_ids AS (
                 SELECT DISTINCT concept_id FROM filtered_concepts
             ),
             nc_f AS (
-                -- THE big reduction: only note-concept rows for our concepts
-                SELECT /*+ BROADCAST(c) */
-                       nc.hno_id, nc.concept_id, nc.concept_value, nc.concept_source
+                SELECT /*+ BROADCAST(c) */ nc.*
                 FROM CLARITY_LH.CLARITY.NOTE_CONCEPT nc
                 LEFT SEMI JOIN concept_ids c
                     ON nc.concept_id = c.concept_id
@@ -41,13 +42,13 @@ pipeline_configs = [
                 SELECT DISTINCT hno_id AS note_id FROM nc_f
             ),
             eni_f AS (
-                SELECT eni.note_id, eni.author_user_id, eni.entry_instant_dttm
+                SELECT eni.*
                 FROM CLARITY_LH.CLARITY.NOTE_ENC_INFO eni
                 LEFT SEMI JOIN note_ids n
                     ON eni.note_id = n.note_id
             ),
             hn_f AS (
-                SELECT hn.note_id, hn.pat_enc_csn_id
+                SELECT hn.*
                 FROM CLARITY_LH.CLARITY.HNO_INFO hn
                 LEFT SEMI JOIN note_ids n
                     ON hn.note_id = n.note_id
@@ -56,15 +57,13 @@ pipeline_configs = [
                 SELECT DISTINCT pat_enc_csn_id FROM hn_f
             ),
             pe_f AS (
-                SELECT pe.pat_id, pe.pat_enc_csn_id, pe.department_id
+                SELECT pe.*
                 FROM CLARITY_LH.CLARITY.PAT_ENC pe
                 LEFT SEMI JOIN csn_ids c
                     ON pe.pat_enc_csn_id = c.pat_enc_csn_id
-                -- Optional, only if you want the PATIENT inner-join check kept exactly:
-                -- LEFT SEMI JOIN CLARITY_LH.CLARITY.PATIENT pat ON pe.pat_id = pat.pat_id
             )
-            SELECT /*+ BROADCAST(fc, cc, cq, dep) */ DISTINCT
-                pe.pat_id                AS pat_id,
+            SELECT /*+ BROADCAST(fc, cq, dep) */ DISTINCT
+                pat.pat_id               AS pat_id,
                 pe.pat_enc_csn_id        AS pat_enc_csn_id,
                 cq.form_name             AS form_name,
                 cq.form_id               AS form_id,
@@ -79,23 +78,25 @@ pipeline_configs = [
                 eni.author_user_id       AS note_author_id,
                 emp.name                 AS note_author_name,
                 eni.entry_instant_dttm   AS note_created
-            FROM nc_f nc
-            JOIN filtered_concepts fc
-                ON nc.concept_id = fc.concept_id
-            JOIN amb_concepts cc
-                ON cc.concept_id = fc.concept_id
-            JOIN CLARITY_LH.CLARITY.CL_QFORM cq
-                ON fc.form_id = cq.form_id
-            JOIN eni_f eni
-                ON nc.hno_id = eni.note_id
-            JOIN hn_f hn
-                ON hn.note_id = eni.note_id
-            JOIN pe_f pe
+            FROM CLARITY_LH.CLARITY.PATIENT AS pat
+            INNER JOIN pe_f AS pe
+                ON pe.pat_id = pat.pat_id
+            INNER JOIN hn_f AS hn
                 ON pe.pat_enc_csn_id = hn.pat_enc_csn_id
-            JOIN CLARITY_LH.CLARITY.CLARITY_DEP dep
+            INNER JOIN eni_f AS eni
+                ON hn.note_id = eni.note_id
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_DEP AS dep
                 ON pe.department_id = dep.department_id
-            JOIN CLARITY_LH.CLARITY.CLARITY_EMP emp
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_EMP AS emp
                 ON eni.author_user_id = emp.user_id
+            INNER JOIN nc_f AS nc
+                ON nc.hno_id = eni.note_id
+            INNER JOIN filtered_concepts AS fc
+                ON nc.concept_id = fc.concept_id
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_CONCEPT AS cc
+                ON cc.concept_id = fc.concept_id
+            INNER JOIN CLARITY_LH.CLARITY.CL_QFORM AS cq
+                ON fc.form_id = cq.form_id
         """,
         "primary_keys": "",
         "non_key_columns": "PAT_ID,PAT_ENC_CSN_ID,FORM_NAME,FORM_ID,CONCEPT_NAME,ABBREVIATION,CONCEPT_VALUE,CONCEPT_ID,CONCEPT_SOURCE,DEPARTMENT_ID,DEPARTMENT_NAME,NOTE_ENCOUNTER_NOTE_ID,NOTE_AUTHOR_ID,NOTE_AUTHOR_NAME,NOTE_CREATED",
