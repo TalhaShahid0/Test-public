@@ -1,4 +1,13 @@
--- Oracle
-SELECT MAX(contact_date) FROM clarity.pat_enc WHERE contact_date <= SYSDATE;
--- Fabric (SQL endpoint)
-SELECT MAX(CONTACT_DATE) FROM CLARITY.PAT_ENC WHERE CONTACT_DATE <= GETDATE();
+SELECT
+  (SELECT COUNT(*) FROM clarity.pat_enc WHERE contact_date >= DATE '2026-01-01') AS pat_enc_cnt,
+  (SELECT COUNT(*) FROM clarity.pat_enc_curr_meds m JOIN clarity.pat_enc pe ON pe.pat_enc_csn_id = m.pat_enc_csn_id WHERE pe.contact_date >= DATE '2026-01-01') AS curr_meds_cnt,
+  (SELECT COUNT(*) FROM clarity.pat_enc_ip_meds m JOIN clarity.pat_enc pe ON pe.pat_enc_csn_id = m.pat_enc_csn_id WHERE pe.contact_date >= DATE '2026-01-01') AS ip_meds_cnt,
+  (SELECT COUNT(*) FROM clarity.order_med WHERE ordering_date >= DATE '2026-01-01') AS order_med_cnt
+FROM dual;
+
+
+SELECT
+  (SELECT COUNT(*) FROM CLARITY.PAT_ENC WHERE CONTACT_DATE >= '2026-01-01') AS pat_enc_cnt,
+  (SELECT COUNT(*) FROM CLARITY.PAT_ENC_CURR_MEDS m JOIN CLARITY.PAT_ENC pe ON pe.PAT_ENC_CSN_ID = m.PAT_ENC_CSN_ID WHERE pe.CONTACT_DATE >= '2026-01-01') AS curr_meds_cnt,
+  (SELECT COUNT(*) FROM CLARITY.PAT_ENC_IP_MEDS m JOIN CLARITY.PAT_ENC pe ON pe.PAT_ENC_CSN_ID = m.PAT_ENC_CSN_ID WHERE pe.CONTACT_DATE >= '2026-01-01') AS ip_meds_cnt,
+  (SELECT COUNT(*) FROM CLARITY.ORDER_MED WHERE ORDERING_DATE >= '2026-01-01') AS order_med_cnt;
