@@ -1,234 +1,141 @@
-# CONFIG_NB entry for ALLERGY.MV_ALLERGY_NOTES_C -> ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_NOTES
+# CONFIG_NB entry for ALLERGY.MV_ALLERGY_OR_REPORT -> ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_OR_REPORT
 #
-# Same result as the Oracle MV. Oracle pieces translated 1:1:
-#   RANK() ... ORDER BY CONTACT_DATE_REAL DESC  -> same RANK (ties kept), plus
-#       NULLS FIRST, because Oracle DESC puts NULLs first and Spark puts them last.
-#   TRIM(x) IS NOT NULL -> length(trim(x)) > 0  (Oracle: '' and all-space = NULL)
-#   CAST(NULL AS VARCHAR2(2000)) -> CAST(NULL AS STRING)
-#   REGEXP_REPLACE(.., '[[:cntrl:]]', '') -> '[\p{Cc}]' (Java regex; Java does NOT
-#       understand [[:cntrl:]], it would only remove the letters c,n,t,r,l,:)
-#   UPPER -> upper (same for normal text; Java upper turns 'ß' into 'SS', Oracle keeps 'ß')
-#   XMLSERIALIZE(CONTENT XMLAGG(XMLELEMENT(e, txt || CHR(13)) ORDER BY LINE) AS CLOB)
-#       -> per line '<E>' || xml_escape(txt) || CHR(13) || '</E>', joined in LINE
-#          order. XMLSERIALIZE (without EXTRACT('//text()')) keeps the <E> tags and
-#          the escaping (&amp; &lt; &gt; &quot; &apos;), so we produce them too.
+# Same result as the Oracle MV (inner SELECT DISTINCT "mst" and the outer
+# LEFT JOIN to the OR_CASE / OR_CASE_ALL_PROC "cases" subquery are kept).
+#
+# Oracle (+) mapping:
+#   l.pat_id = mvp.pat_id, l.log_id = proc.log_id      -> INNER (no (+))
+#   l.log_id = surg.log_id(+) AND surg.panel = proc.all_procs_panel(+)
+#       -> effectively INNER for both surg and proc. proc is the (+) side of the
+#          panel condition but is also joined to l without (+), so null-extended
+#          proc rows are removed; then surg.panel must equal a real panel, so
+#          null-extended surg rows are removed too (Oracle "simple join" rule).
+#          Written as: proc ON log_id, surg ON log_id AND panel. Same rows.
+#   loc, zp, ser, pr, serv1, zrole, zos, pat, b          -> LEFT JOIN
+#   ser.prov_id = sid.prov_id(+) AND sid.identity_type_id(+) = 50
+#       -> LEFT JOIN sid ON sid.prov_id = ser.prov_id AND sid.identity_type_id = 50
+#          (the = 50 stays in ON, not WHERE)
+#   mst.log_id = cases.or_case_id(+) AND mst.or_proc_id = cases.or_proc_id(+)
+#       -> LEFT JOIN cases ON both columns
 #
 # Performance changes (result unchanged):
-#   1. Only PAT_ENC_CSN_ID of MV_ALLERGY_PAT_ENC is used downstream (PAT_ID and
-#      PAT_MRN_ID are never selected), so only that column is read. The join is
-#      still a normal INNER JOIN, so row multiplicity (and XMLAGG text) is the same.
-#   2. The small set of NOTE_IDs is built first; NOTE_ENC_INFO and HNO_NOTE_TEXT
-#      (very big) are cut down to those notes (LEFT SEMI JOIN) before any join.
-#   3. Blank text lines dropped while reading HNO_NOTE_TEXT (same filter as the MV).
-#   4. The 5 ZC lookups are joined on NOTE_ENC_INFO (one row per contact), not on
-#      every text line; BROADCAST hints on all ZC tables. LEFT JOINs on NEI columns
-#      only, so moving them before the text join does not change any row.
-#   5. Text is aggregated only after RN = 1 filter (same as the MV).
+#   1. MV_PAT_ID -> TBL_PAT_ID (active rows only: latest version per ROW_HASH,
+#      IS_DELETED = 0, same rule MERGE_NB uses). It is only a filter on pat_id,
+#      so it is a LEFT SEMI JOIN; the DISTINCT already removed any duplicates
+#      the plain join could create. OR_LOG is cut to these patients FIRST.
+#   2. IP_DATA_STORE (b) is a LEFT JOIN whose columns are never selected; under
+#      SELECT DISTINCT it cannot add or remove rows, so it is dropped.
+#   3. "cases": OR_CASE LEFT JOIN OR_CASE_ALL_PROC -> INNER JOIN. A case with no
+#      proc row has or_proc_id NULL, which can never match mst.or_proc_id, so
+#      those rows never matched the outer LEFT JOIN anyway. Output identical.
+#   4. BROADCAST hints on the small ZC_* / CLARITY_LOC / OR_PROC lookups.
 #
-# ASSUMPTION: ALLERGY.MV_ALLERGY_PAT_ENC is loaded into Fabric as
-#   ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC by this same pipeline (active rows =
-#   latest version per ROW_HASH, IS_DELETED = 0, the rule MERGE_NB uses). That
-#   entry must run before this one. If the name is different, change it in `cced`.
-#
-# source_query is a raw string (r"""..."""): the SQL must contain '[\\p{Cc}]'
-# (two backslashes) because Spark SQL strips one when reading the literal.
-# Keep the r prefix, otherwise Python eats one more backslash.
+# primary_keys = "" (MV has no PK) -> MERGE_NB mode A (row_hash over whole row).
+# TBL_PAT_ID must run before this entry (orchestrator runs sequentially).
 
 pipeline_configs = [
     {
-        "pipeline_name": "TBL_ALLERGY_NOTES",
-        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_NOTES",
+        "pipeline_name": "TBL_ALLERGY_OR_REPORT",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_OR_REPORT",
         "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
-        "source_query": r"""
-            WITH cced AS (
-                SELECT PAT_ENC_CSN_ID
+        "source_query": """
+            WITH active_pat_ids AS (
+                SELECT PAT_ID
                 FROM (
-                    SELECT PAT_ENC_CSN_ID, IS_DELETED,
+                    SELECT PAT_ID, IS_DELETED,
                            ROW_NUMBER() OVER (
                                PARTITION BY ROW_HASH
                                ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC
                            ) AS rn
-                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC
+                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID
                 ) t
                 WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
             ),
-            notes AS (
-                SELECT /*+ BROADCAST(nti) */
-                    hno.PAT_ENC_CSN_ID,
-                    hno.IP_NOTE_TYPE_C,
-                    nti.NAME AS IP_NOTE_TYPE,
-                    hno.CM_PHY_OWNER_ID,
-                    hno.CM_LOG_OWNER_ID,
-                    hno.NOTE_DESC,
-                    hno.NOTE_ID
-                FROM cced
-                INNER JOIN CLARITY_LH.CLARITY.HNO_INFO hno
-                    ON cced.PAT_ENC_CSN_ID = hno.PAT_ENC_CSN_ID
-                   AND (hno.DELETE_USER_ID IS NULL OR hno.DELETE_INSTANT_DTTM IS NULL)
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_TYPE_IP nti
-                    ON hno.IP_NOTE_TYPE_C = nti.TYPE_IP_C
+            l AS (
+                SELECT ol.log_id, ol.pat_id, ol.pat_type_c, ol.surgery_date,
+                       ol.loc_id, ol.total_time_needed, ol.status_c,
+                       ol.proc_not_perf_c
+                FROM CLARITY_LH.CLARITY.OR_LOG ol
+                LEFT SEMI JOIN active_pat_ids a ON ol.pat_id = a.PAT_ID
             ),
-            note_ids AS (
-                SELECT DISTINCT NOTE_ID FROM notes
+            mst AS (
+                SELECT /*+ BROADCAST(loc, zp, pr, serv1, zrole, zos) */ DISTINCT
+                    l.log_id             AS LOG_ID,
+                    pat.pat_mrn_id       AS PAT_MRN_ID,
+                    pat.pat_id           AS PAT_ID,
+                    pat.pat_name         AS PAT_NAME,
+                    l.pat_type_c         AS PAT_TYPE_C,
+                    zp.name              AS PATCLASS,
+                    l.surgery_date       AS SURGERY_DATE,
+                    ser.prov_id          AS PROV_ID,
+                    ser.prov_name        AS PROV_NAME,
+                    sid.identity_id      AS ROV_IDENTITY_ID,
+                    l.loc_id             AS LOC_ID,
+                    loc.loc_name         AS LOC_NAME,
+                    proc.or_proc_id      AS OR_PROC_ID,
+                    pr.proc_name         AS PROC_NAME,
+                    l.total_time_needed  AS TOTAL_TIME_NEEDED,
+                    pr.primary_ext_id    AS PRIMARY_EXT_ID,
+                    surg.surg_id         AS SURG_ID,
+                    surg.role_c          AS ROLE_C,
+                    zrole.name           AS ROLE,
+                    serv1.name           AS SURGEONSERVICE,
+                    l.status_c           AS STATUS_C,
+                    zos.name             AS LOGSTATUS,
+                    l.proc_not_perf_c    AS PROC_NOT_PERF_C
+                FROM l
+                INNER JOIN CLARITY_LH.CLARITY.OR_LOG_ALL_PROC proc
+                    ON l.log_id = proc.log_id
+                INNER JOIN CLARITY_LH.CLARITY.OR_LOG_ALL_SURG surg
+                    ON l.log_id = surg.log_id
+                   AND surg.panel = proc.all_procs_panel
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_LOC loc
+                    ON l.loc_id = loc.loc_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_PAT_CLASS zp
+                    ON l.pat_type_c = zp.adt_pat_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER ser
+                    ON surg.surg_id = ser.prov_id
+                LEFT JOIN CLARITY_LH.CLARITY.OR_PROC pr
+                    ON proc.or_proc_id = pr.or_proc_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_SERVICE serv1
+                    ON surg.service_c = serv1.service_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_PANEL_ROLE zrole
+                    ON surg.role_c = zrole.role_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_STATUS zos
+                    ON l.status_c = zos.status_c
+                LEFT JOIN CLARITY_LH.CLARITY.PATIENT pat
+                    ON l.pat_id = pat.pat_id
+                LEFT JOIN CLARITY_LH.CLARITY.IDENTITY_SER_ID sid
+                    ON ser.prov_id = sid.prov_id
+                   AND sid.identity_type_id = 50
             ),
-            nei AS (
-                SELECT /*+ BROADCAST(ztt, ztas, zss, znf, ns) */
-                    e.NOTE_ID,
-                    e.CONTACT_SERIAL_NUM,
-                    e.AUTHOR_USER_ID          AS NOTE_AUTHOR_USR_ID,
-                    e.UPDATE_USER_ID          AS NOTE_EDITOR_USR_ID,
-                    e.UPD_AUTHOR_INS_DTTM     AS EDIT_INST,
-                    e.NOTE_FILE_TIME_DTTM     AS FILING_DATE,
-                    e.NOTE_STATUS_C           AS NOTE_STAT_C,
-                    ns.NAME                   AS NOTE_STATUS,
-                    ztt.NAME                  AS TRANSCRIPTION_TYPE,
-                    e.TRN_DOC_AVAIL_STA_C,
-                    ztas.NAME                 AS TRANSCRIPTION_STATUS,
-                    e.SENSITIVE_STAT_C,
-                    zss.NAME                  AS SENSITIVE_STAT,
-                    e.NOTE_FORMAT_C,
-                    znf.NAME                  AS NOTE_FORMAT,
-                    e.SPEC_NOTE_TIME_DTTM     AS SPECIFIED_DATETIME
-                FROM (
-                    SELECT *
-                    FROM CLARITY_LH.CLARITY.NOTE_ENC_INFO x
-                    LEFT SEMI JOIN note_ids n ON x.NOTE_ID = n.NOTE_ID
-                ) e
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_TRANS_TYPE ztt
-                    ON e.TRN_DOC_TYPE_C = ztt.TRANS_TYPE_C
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_TRANS_AVAIL_STS ztas
-                    ON e.TRN_DOC_AVAIL_STA_C = ztas.TRANS_AVAIL_STS_C
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_SENSITIVE_ST zss
-                    ON e.SENSITIVE_STAT_C = zss.SENSITIVE_ST_C
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_FORMAT znf
-                    ON e.NOTE_FORMAT_C = znf.NOTE_FORMAT_C
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_STATUS ns
-                    ON e.NOTE_STATUS_C = ns.NOTE_STATUS_C
-            ),
-            hnt AS (
-                SELECT h.NOTE_ID, h.NOTE_CSN_ID, h.CONTACT_DATE_REAL, h.LINE, h.NOTE_TEXT
-                FROM CLARITY_LH.CLARITY.HNO_NOTE_TEXT h
-                LEFT SEMI JOIN note_ids n ON h.NOTE_ID = n.NOTE_ID
-                WHERE length(trim(h.NOTE_TEXT)) > 0
-            ),
-            note_data AS (
-                SELECT
-                    notes.PAT_ENC_CSN_ID,
-                    notes.IP_NOTE_TYPE_C,
-                    notes.IP_NOTE_TYPE,
-                    notes.CM_PHY_OWNER_ID,
-                    notes.CM_LOG_OWNER_ID,
-                    notes.NOTE_DESC,
-                    notes.NOTE_ID,
-                    hnt.NOTE_CSN_ID,
-                    hnt.CONTACT_DATE_REAL,
-                    nei.NOTE_AUTHOR_USR_ID,
-                    nei.NOTE_EDITOR_USR_ID,
-                    nei.EDIT_INST,
-                    nei.FILING_DATE,
-                    nei.NOTE_STAT_C,
-                    nei.NOTE_STATUS,
-                    nei.TRANSCRIPTION_TYPE,
-                    nei.TRN_DOC_AVAIL_STA_C,
-                    nei.TRANSCRIPTION_STATUS,
-                    CAST(NULL AS STRING) AS TRN_DOC_DESCENDANTS,
-                    nei.SENSITIVE_STAT_C,
-                    nei.SENSITIVE_STAT,
-                    nei.NOTE_FORMAT_C,
-                    nei.NOTE_FORMAT,
-                    nei.SPECIFIED_DATETIME,
-                    hnt.LINE,
-                    hnt.NOTE_TEXT,
-                    RANK() OVER (
-                        PARTITION BY notes.NOTE_ID
-                        ORDER BY hnt.CONTACT_DATE_REAL DESC NULLS FIRST
-                    ) AS RN
-                FROM notes
-                INNER JOIN nei
-                    ON notes.NOTE_ID = nei.NOTE_ID
-                INNER JOIN hnt
-                    ON nei.NOTE_ID = hnt.NOTE_ID
-                   AND nei.CONTACT_SERIAL_NUM = hnt.NOTE_CSN_ID
-            ),
-            latest AS (
-                -- Keep only most recent per NOTE_ID; build each XMLELEMENT(e, ...) piece
-                SELECT
-                    d.*,
-                    concat(
-                        '<E>',
-                        replace(replace(replace(replace(replace(
-                            regexp_replace(upper(trim(d.NOTE_TEXT)), '[\\p{Cc}]', ''),
-                            '&', '&amp;'), '<', '&lt;'), '>', '&gt;'),
-                            '"', '&quot;'), "'", '&apos;'),
-                        char(13),
-                        '</E>'
-                    ) AS XML_PIECE
-                FROM note_data d
-                WHERE d.RN = 1
+            cases AS (
+                SELECT c.or_case_id        AS OR_CASE_ID,
+                       ap.or_proc_id       AS OR_PROC_ID,
+                       c.setup_offset      AS SETUP_OFFSET,
+                       c.cleanup_offset    AS CLEANUP_OFFSET,
+                       ap.defaulted_length AS DEFAULTED_LENGTH,
+                       ap.total_length     AS PROC_LENGTH
+                FROM CLARITY_LH.CLARITY.OR_CASE c
+                INNER JOIN CLARITY_LH.CLARITY.OR_CASE_ALL_PROC ap
+                    ON ap.or_case_id = c.or_case_id
             )
-            SELECT
-                PAT_ENC_CSN_ID,
-                IP_NOTE_TYPE_C,
-                IP_NOTE_TYPE,
-                CM_PHY_OWNER_ID,
-                CM_LOG_OWNER_ID,
-                NOTE_DESC,
-                NOTE_ID,
-                NOTE_CSN_ID,
-                CONTACT_DATE_REAL,
-                NOTE_AUTHOR_USR_ID,
-                NOTE_EDITOR_USR_ID,
-                EDIT_INST,
-                FILING_DATE,
-                NOTE_STAT_C,
-                NOTE_STATUS,
-                TRANSCRIPTION_TYPE,
-                TRN_DOC_AVAIL_STA_C,
-                TRANSCRIPTION_STATUS,
-                TRN_DOC_DESCENDANTS,
-                SENSITIVE_STAT_C,
-                SENSITIVE_STAT,
-                NOTE_FORMAT_C,
-                NOTE_FORMAT,
-                SPECIFIED_DATETIME,
-                array_join(
-                    transform(
-                        array_sort(collect_list(named_struct('line', LINE, 'txt', XML_PIECE))),
-                        x -> x.txt
-                    ),
-                    ''
-                ) AS NOTE_TEXT
-            FROM latest
-            GROUP BY
-                PAT_ENC_CSN_ID,
-                IP_NOTE_TYPE_C,
-                IP_NOTE_TYPE,
-                CM_PHY_OWNER_ID,
-                CM_LOG_OWNER_ID,
-                NOTE_DESC,
-                NOTE_ID,
-                NOTE_CSN_ID,
-                CONTACT_DATE_REAL,
-                NOTE_AUTHOR_USR_ID,
-                NOTE_EDITOR_USR_ID,
-                EDIT_INST,
-                FILING_DATE,
-                NOTE_STAT_C,
-                NOTE_STATUS,
-                TRANSCRIPTION_TYPE,
-                TRN_DOC_AVAIL_STA_C,
-                TRANSCRIPTION_STATUS,
-                TRN_DOC_DESCENDANTS,
-                SENSITIVE_STAT_C,
-                SENSITIVE_STAT,
-                NOTE_FORMAT_C,
-                NOTE_FORMAT,
-                SPECIFIED_DATETIME
+            SELECT mst.LOG_ID, mst.PAT_MRN_ID, mst.PAT_ID, mst.PAT_NAME, mst.PAT_TYPE_C,
+                   mst.PATCLASS, mst.SURGERY_DATE, mst.PROV_ID, mst.PROV_NAME,
+                   mst.ROV_IDENTITY_ID, mst.LOC_ID, mst.LOC_NAME, mst.OR_PROC_ID,
+                   mst.PROC_NAME, mst.TOTAL_TIME_NEEDED, mst.PRIMARY_EXT_ID, mst.SURG_ID,
+                   mst.ROLE_C, mst.ROLE, mst.SURGEONSERVICE, mst.STATUS_C, mst.LOGSTATUS,
+                   mst.PROC_NOT_PERF_C,
+                   cases.SETUP_OFFSET, cases.CLEANUP_OFFSET, cases.DEFAULTED_LENGTH,
+                   cases.PROC_LENGTH
+            FROM mst
+            LEFT JOIN cases
+                ON mst.LOG_ID = cases.OR_CASE_ID
+               AND mst.OR_PROC_ID = cases.OR_PROC_ID
         """,
-        # One row per note contact. MERGE_NB checks uniqueness and fails clearly if not.
-        "primary_keys": "NOTE_ID,NOTE_CSN_ID",
-        "non_key_columns": "PAT_ENC_CSN_ID,IP_NOTE_TYPE_C,IP_NOTE_TYPE,CM_PHY_OWNER_ID,CM_LOG_OWNER_ID,NOTE_DESC,CONTACT_DATE_REAL,NOTE_AUTHOR_USR_ID,NOTE_EDITOR_USR_ID,EDIT_INST,FILING_DATE,NOTE_STAT_C,NOTE_STATUS,TRANSCRIPTION_TYPE,TRN_DOC_AVAIL_STA_C,TRANSCRIPTION_STATUS,TRN_DOC_DESCENDANTS,SENSITIVE_STAT_C,SENSITIVE_STAT,NOTE_FORMAT_C,NOTE_FORMAT,SPECIFIED_DATETIME,NOTE_TEXT",
-        "identity_column": "ALLERGY_NOTES_KEY",
+        "primary_keys": "",
+        "non_key_columns": "LOG_ID,PAT_MRN_ID,PAT_ID,PAT_NAME,PAT_TYPE_C,PATCLASS,SURGERY_DATE,PROV_ID,PROV_NAME,ROV_IDENTITY_ID,LOC_ID,LOC_NAME,OR_PROC_ID,PROC_NAME,TOTAL_TIME_NEEDED,PRIMARY_EXT_ID,SURG_ID,ROLE_C,ROLE,SURGEONSERVICE,STATUS_C,LOGSTATUS,PROC_NOT_PERF_C,SETUP_OFFSET,CLEANUP_OFFSET,DEFAULTED_LENGTH,PROC_LENGTH",
+        "identity_column": "ALLERGY_OR_REPORT_KEY",
         "load_type": "FULL",
     },
 ]
