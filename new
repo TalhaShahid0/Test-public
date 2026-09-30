@@ -1,13 +1,234 @@
-SELECT
-  (SELECT COUNT(*) FROM clarity.pat_enc WHERE contact_date >= DATE '2026-01-01') AS pat_enc_cnt,
-  (SELECT COUNT(*) FROM clarity.pat_enc_curr_meds m JOIN clarity.pat_enc pe ON pe.pat_enc_csn_id = m.pat_enc_csn_id WHERE pe.contact_date >= DATE '2026-01-01') AS curr_meds_cnt,
-  (SELECT COUNT(*) FROM clarity.pat_enc_ip_meds m JOIN clarity.pat_enc pe ON pe.pat_enc_csn_id = m.pat_enc_csn_id WHERE pe.contact_date >= DATE '2026-01-01') AS ip_meds_cnt,
-  (SELECT COUNT(*) FROM clarity.order_med WHERE ordering_date >= DATE '2026-01-01') AS order_med_cnt
-FROM dual;
+# CONFIG_NB entry for ALLERGY.MV_ALLERGY_NOTES_C -> ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_NOTES
+#
+# Same result as the Oracle MV. Oracle pieces translated 1:1:
+#   RANK() ... ORDER BY CONTACT_DATE_REAL DESC  -> same RANK (ties kept), plus
+#       NULLS FIRST, because Oracle DESC puts NULLs first and Spark puts them last.
+#   TRIM(x) IS NOT NULL -> length(trim(x)) > 0  (Oracle: '' and all-space = NULL)
+#   CAST(NULL AS VARCHAR2(2000)) -> CAST(NULL AS STRING)
+#   REGEXP_REPLACE(.., '[[:cntrl:]]', '') -> '[\p{Cc}]' (Java regex; Java does NOT
+#       understand [[:cntrl:]], it would only remove the letters c,n,t,r,l,:)
+#   UPPER -> upper (same for normal text; Java upper turns 'ß' into 'SS', Oracle keeps 'ß')
+#   XMLSERIALIZE(CONTENT XMLAGG(XMLELEMENT(e, txt || CHR(13)) ORDER BY LINE) AS CLOB)
+#       -> per line '<E>' || xml_escape(txt) || CHR(13) || '</E>', joined in LINE
+#          order. XMLSERIALIZE (without EXTRACT('//text()')) keeps the <E> tags and
+#          the escaping (&amp; &lt; &gt; &quot; &apos;), so we produce them too.
+#
+# Performance changes (result unchanged):
+#   1. Only PAT_ENC_CSN_ID of MV_ALLERGY_PAT_ENC is used downstream (PAT_ID and
+#      PAT_MRN_ID are never selected), so only that column is read. The join is
+#      still a normal INNER JOIN, so row multiplicity (and XMLAGG text) is the same.
+#   2. The small set of NOTE_IDs is built first; NOTE_ENC_INFO and HNO_NOTE_TEXT
+#      (very big) are cut down to those notes (LEFT SEMI JOIN) before any join.
+#   3. Blank text lines dropped while reading HNO_NOTE_TEXT (same filter as the MV).
+#   4. The 5 ZC lookups are joined on NOTE_ENC_INFO (one row per contact), not on
+#      every text line; BROADCAST hints on all ZC tables. LEFT JOINs on NEI columns
+#      only, so moving them before the text join does not change any row.
+#   5. Text is aggregated only after RN = 1 filter (same as the MV).
+#
+# ASSUMPTION: ALLERGY.MV_ALLERGY_PAT_ENC is loaded into Fabric as
+#   ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC by this same pipeline (active rows =
+#   latest version per ROW_HASH, IS_DELETED = 0, the rule MERGE_NB uses). That
+#   entry must run before this one. If the name is different, change it in `cced`.
+#
+# source_query is a raw string (r"""..."""): the SQL must contain '[\\p{Cc}]'
+# (two backslashes) because Spark SQL strips one when reading the literal.
+# Keep the r prefix, otherwise Python eats one more backslash.
 
-
-SELECT
-  (SELECT COUNT(*) FROM CLARITY.PAT_ENC WHERE CONTACT_DATE >= '2026-01-01') AS pat_enc_cnt,
-  (SELECT COUNT(*) FROM CLARITY.PAT_ENC_CURR_MEDS m JOIN CLARITY.PAT_ENC pe ON pe.PAT_ENC_CSN_ID = m.PAT_ENC_CSN_ID WHERE pe.CONTACT_DATE >= '2026-01-01') AS curr_meds_cnt,
-  (SELECT COUNT(*) FROM CLARITY.PAT_ENC_IP_MEDS m JOIN CLARITY.PAT_ENC pe ON pe.PAT_ENC_CSN_ID = m.PAT_ENC_CSN_ID WHERE pe.CONTACT_DATE >= '2026-01-01') AS ip_meds_cnt,
-  (SELECT COUNT(*) FROM CLARITY.ORDER_MED WHERE ORDERING_DATE >= '2026-01-01') AS order_med_cnt;
+pipeline_configs = [
+    {
+        "pipeline_name": "TBL_ALLERGY_NOTES",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_NOTES",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": r"""
+            WITH cced AS (
+                SELECT PAT_ENC_CSN_ID
+                FROM (
+                    SELECT PAT_ENC_CSN_ID, IS_DELETED,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ROW_HASH
+                               ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC
+                           ) AS rn
+                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC
+                ) t
+                WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
+            ),
+            notes AS (
+                SELECT /*+ BROADCAST(nti) */
+                    hno.PAT_ENC_CSN_ID,
+                    hno.IP_NOTE_TYPE_C,
+                    nti.NAME AS IP_NOTE_TYPE,
+                    hno.CM_PHY_OWNER_ID,
+                    hno.CM_LOG_OWNER_ID,
+                    hno.NOTE_DESC,
+                    hno.NOTE_ID
+                FROM cced
+                INNER JOIN CLARITY_LH.CLARITY.HNO_INFO hno
+                    ON cced.PAT_ENC_CSN_ID = hno.PAT_ENC_CSN_ID
+                   AND (hno.DELETE_USER_ID IS NULL OR hno.DELETE_INSTANT_DTTM IS NULL)
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_TYPE_IP nti
+                    ON hno.IP_NOTE_TYPE_C = nti.TYPE_IP_C
+            ),
+            note_ids AS (
+                SELECT DISTINCT NOTE_ID FROM notes
+            ),
+            nei AS (
+                SELECT /*+ BROADCAST(ztt, ztas, zss, znf, ns) */
+                    e.NOTE_ID,
+                    e.CONTACT_SERIAL_NUM,
+                    e.AUTHOR_USER_ID          AS NOTE_AUTHOR_USR_ID,
+                    e.UPDATE_USER_ID          AS NOTE_EDITOR_USR_ID,
+                    e.UPD_AUTHOR_INS_DTTM     AS EDIT_INST,
+                    e.NOTE_FILE_TIME_DTTM     AS FILING_DATE,
+                    e.NOTE_STATUS_C           AS NOTE_STAT_C,
+                    ns.NAME                   AS NOTE_STATUS,
+                    ztt.NAME                  AS TRANSCRIPTION_TYPE,
+                    e.TRN_DOC_AVAIL_STA_C,
+                    ztas.NAME                 AS TRANSCRIPTION_STATUS,
+                    e.SENSITIVE_STAT_C,
+                    zss.NAME                  AS SENSITIVE_STAT,
+                    e.NOTE_FORMAT_C,
+                    znf.NAME                  AS NOTE_FORMAT,
+                    e.SPEC_NOTE_TIME_DTTM     AS SPECIFIED_DATETIME
+                FROM (
+                    SELECT *
+                    FROM CLARITY_LH.CLARITY.NOTE_ENC_INFO x
+                    LEFT SEMI JOIN note_ids n ON x.NOTE_ID = n.NOTE_ID
+                ) e
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_TRANS_TYPE ztt
+                    ON e.TRN_DOC_TYPE_C = ztt.TRANS_TYPE_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_TRANS_AVAIL_STS ztas
+                    ON e.TRN_DOC_AVAIL_STA_C = ztas.TRANS_AVAIL_STS_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_SENSITIVE_ST zss
+                    ON e.SENSITIVE_STAT_C = zss.SENSITIVE_ST_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_FORMAT znf
+                    ON e.NOTE_FORMAT_C = znf.NOTE_FORMAT_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_STATUS ns
+                    ON e.NOTE_STATUS_C = ns.NOTE_STATUS_C
+            ),
+            hnt AS (
+                SELECT h.NOTE_ID, h.NOTE_CSN_ID, h.CONTACT_DATE_REAL, h.LINE, h.NOTE_TEXT
+                FROM CLARITY_LH.CLARITY.HNO_NOTE_TEXT h
+                LEFT SEMI JOIN note_ids n ON h.NOTE_ID = n.NOTE_ID
+                WHERE length(trim(h.NOTE_TEXT)) > 0
+            ),
+            note_data AS (
+                SELECT
+                    notes.PAT_ENC_CSN_ID,
+                    notes.IP_NOTE_TYPE_C,
+                    notes.IP_NOTE_TYPE,
+                    notes.CM_PHY_OWNER_ID,
+                    notes.CM_LOG_OWNER_ID,
+                    notes.NOTE_DESC,
+                    notes.NOTE_ID,
+                    hnt.NOTE_CSN_ID,
+                    hnt.CONTACT_DATE_REAL,
+                    nei.NOTE_AUTHOR_USR_ID,
+                    nei.NOTE_EDITOR_USR_ID,
+                    nei.EDIT_INST,
+                    nei.FILING_DATE,
+                    nei.NOTE_STAT_C,
+                    nei.NOTE_STATUS,
+                    nei.TRANSCRIPTION_TYPE,
+                    nei.TRN_DOC_AVAIL_STA_C,
+                    nei.TRANSCRIPTION_STATUS,
+                    CAST(NULL AS STRING) AS TRN_DOC_DESCENDANTS,
+                    nei.SENSITIVE_STAT_C,
+                    nei.SENSITIVE_STAT,
+                    nei.NOTE_FORMAT_C,
+                    nei.NOTE_FORMAT,
+                    nei.SPECIFIED_DATETIME,
+                    hnt.LINE,
+                    hnt.NOTE_TEXT,
+                    RANK() OVER (
+                        PARTITION BY notes.NOTE_ID
+                        ORDER BY hnt.CONTACT_DATE_REAL DESC NULLS FIRST
+                    ) AS RN
+                FROM notes
+                INNER JOIN nei
+                    ON notes.NOTE_ID = nei.NOTE_ID
+                INNER JOIN hnt
+                    ON nei.NOTE_ID = hnt.NOTE_ID
+                   AND nei.CONTACT_SERIAL_NUM = hnt.NOTE_CSN_ID
+            ),
+            latest AS (
+                -- Keep only most recent per NOTE_ID; build each XMLELEMENT(e, ...) piece
+                SELECT
+                    d.*,
+                    concat(
+                        '<E>',
+                        replace(replace(replace(replace(replace(
+                            regexp_replace(upper(trim(d.NOTE_TEXT)), '[\\p{Cc}]', ''),
+                            '&', '&amp;'), '<', '&lt;'), '>', '&gt;'),
+                            '"', '&quot;'), "'", '&apos;'),
+                        char(13),
+                        '</E>'
+                    ) AS XML_PIECE
+                FROM note_data d
+                WHERE d.RN = 1
+            )
+            SELECT
+                PAT_ENC_CSN_ID,
+                IP_NOTE_TYPE_C,
+                IP_NOTE_TYPE,
+                CM_PHY_OWNER_ID,
+                CM_LOG_OWNER_ID,
+                NOTE_DESC,
+                NOTE_ID,
+                NOTE_CSN_ID,
+                CONTACT_DATE_REAL,
+                NOTE_AUTHOR_USR_ID,
+                NOTE_EDITOR_USR_ID,
+                EDIT_INST,
+                FILING_DATE,
+                NOTE_STAT_C,
+                NOTE_STATUS,
+                TRANSCRIPTION_TYPE,
+                TRN_DOC_AVAIL_STA_C,
+                TRANSCRIPTION_STATUS,
+                TRN_DOC_DESCENDANTS,
+                SENSITIVE_STAT_C,
+                SENSITIVE_STAT,
+                NOTE_FORMAT_C,
+                NOTE_FORMAT,
+                SPECIFIED_DATETIME,
+                array_join(
+                    transform(
+                        array_sort(collect_list(named_struct('line', LINE, 'txt', XML_PIECE))),
+                        x -> x.txt
+                    ),
+                    ''
+                ) AS NOTE_TEXT
+            FROM latest
+            GROUP BY
+                PAT_ENC_CSN_ID,
+                IP_NOTE_TYPE_C,
+                IP_NOTE_TYPE,
+                CM_PHY_OWNER_ID,
+                CM_LOG_OWNER_ID,
+                NOTE_DESC,
+                NOTE_ID,
+                NOTE_CSN_ID,
+                CONTACT_DATE_REAL,
+                NOTE_AUTHOR_USR_ID,
+                NOTE_EDITOR_USR_ID,
+                EDIT_INST,
+                FILING_DATE,
+                NOTE_STAT_C,
+                NOTE_STATUS,
+                TRANSCRIPTION_TYPE,
+                TRN_DOC_AVAIL_STA_C,
+                TRANSCRIPTION_STATUS,
+                TRN_DOC_DESCENDANTS,
+                SENSITIVE_STAT_C,
+                SENSITIVE_STAT,
+                NOTE_FORMAT_C,
+                NOTE_FORMAT,
+                SPECIFIED_DATETIME
+        """,
+        # One row per note contact. MERGE_NB checks uniqueness and fails clearly if not.
+        "primary_keys": "NOTE_ID,NOTE_CSN_ID",
+        "non_key_columns": "PAT_ENC_CSN_ID,IP_NOTE_TYPE_C,IP_NOTE_TYPE,CM_PHY_OWNER_ID,CM_LOG_OWNER_ID,NOTE_DESC,CONTACT_DATE_REAL,NOTE_AUTHOR_USR_ID,NOTE_EDITOR_USR_ID,EDIT_INST,FILING_DATE,NOTE_STAT_C,NOTE_STATUS,TRANSCRIPTION_TYPE,TRN_DOC_AVAIL_STA_C,TRANSCRIPTION_STATUS,TRN_DOC_DESCENDANTS,SENSITIVE_STAT_C,SENSITIVE_STAT,NOTE_FORMAT_C,NOTE_FORMAT,SPECIFIED_DATETIME,NOTE_TEXT",
+        "identity_column": "ALLERGY_NOTES_KEY",
+        "load_type": "FULL",
+    },
+]
