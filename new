@@ -1,105 +1,13 @@
-pipeline_configs = [
-    {
-        "pipeline_name": "TBL_ALLERGY_MEDS",
-        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_MEDS",
-        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
-        "source_query": """
-            WITH active_pat_ids AS (
-                SELECT PAT_ID
-                FROM (
-                    SELECT PAT_ID, IS_DELETED,
-                           ROW_NUMBER() OVER (PARTITION BY ROW_HASH
-                                              ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC) AS rn
-                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID
-                ) t
-                WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
-            ),
-            pat AS (
-                SELECT p.pat_id, p.pat_mrn_id
-                FROM CLARITY_LH.CLARITY.PATIENT p
-                LEFT SEMI JOIN active_pat_ids a ON p.pat_id = a.PAT_ID
-            ),
-            enc AS (
-                SELECT pat.pat_id, pat.pat_mrn_id, pe.pat_enc_csn_id, pe.appt_prc_id,
-                       pe.appt_status_c, pe.contact_date, pe.enc_close_date, pe.department_id
-                FROM CLARITY_LH.CLARITY.PAT_ENC pe
-                INNER JOIN pat ON pe.pat_id = pat.pat_id
-            ),
-            med_links AS (
-                SELECT 1 AS src_branch, pecm.pat_enc_csn_id,
-                       pecm.current_med_id AS order_med_id, pecm.is_active_yn
-                FROM CLARITY_LH.CLARITY.PAT_ENC_CURR_MEDS pecm
-                UNION ALL
-                SELECT 2 AS src_branch, peim.pat_enc_csn_id,
-                       peim.meds_inp_enc_ord_id AS order_med_id,
-                       CAST(NULL AS STRING) AS is_active_yn
-                FROM CLARITY_LH.CLARITY.PAT_ENC_IP_MEDS peim
-            ),
-            enc_meds AS (
-                SELECT e.*, l.src_branch, l.order_med_id, l.is_active_yn
-                FROM enc e
-                INNER JOIN med_links l ON e.pat_enc_csn_id = l.pat_enc_csn_id
-            )
-            SELECT PAT_ID, PAT_MRN_ID, APPT_PRC_ID, APPT_STATUS_C, CONTACT_DATE,
-                   ENC_CLOSE_DATE, ORDER_MED_ID, ORDERING_DATE, FREQ_NAME, SIG,
-                   HV_DISCRETE_DOSE, MIN_DISCRETE_DOSE, MAX_DISCRETE_DOSE, QUANTITY, REFILLS,
-                   START_DATE, END_DATE, NAME, PAT_ENC_CSN_ID, IS_ACTIVE_YN,
-                   CRRNT_LONG_TERM_YN, ORDER_CLASS_C, ORDERING_MODE, MEDUNIT, ORDERCLASS,
-                   MEDROUTE, THERCLASS, PHARMCLASS, PHARMSUBCLASS, GENERIC_NAME,
-                   DEPARTMENT_ID, DEPARTMENT_NAME
-            FROM (
-                SELECT /*+ BROADCAST(zoc, zmu, zar, ipf, ztc, zpc, zps, cd, zom) */ DISTINCT
-                    em.src_branch           AS SRC_BRANCH,
-                    em.pat_id               AS PAT_ID,
-                    em.pat_mrn_id           AS PAT_MRN_ID,
-                    em.appt_prc_id          AS APPT_PRC_ID,
-                    em.appt_status_c        AS APPT_STATUS_C,
-                    em.contact_date         AS CONTACT_DATE,
-                    em.enc_close_date       AS ENC_CLOSE_DATE,
-                    om.order_med_id         AS ORDER_MED_ID,
-                    om.ordering_date        AS ORDERING_DATE,
-                    ipf.freq_name           AS FREQ_NAME,
-                    om.sig                  AS SIG,
-                    om.hv_discrete_dose     AS HV_DISCRETE_DOSE,
-                    om.min_discrete_dose    AS MIN_DISCRETE_DOSE,
-                    om.max_discrete_dose    AS MAX_DISCRETE_DOSE,
-                    om.quantity             AS QUANTITY,
-                    om.refills              AS REFILLS,
-                    om.start_date           AS START_DATE,
-                    om.end_date             AS END_DATE,
-                    cm.name                 AS NAME,
-                    em.pat_enc_csn_id       AS PAT_ENC_CSN_ID,
-                    em.is_active_yn         AS IS_ACTIVE_YN,
-                    mmpl.crrnt_long_term_yn AS CRRNT_LONG_TERM_YN,
-                    om.order_class_c        AS ORDER_CLASS_C,
-                    zom.name                AS ORDERING_MODE,
-                    zmu.name                AS MEDUNIT,
-                    zoc.name                AS ORDERCLASS,
-                    zar.name                AS MEDROUTE,
-                    ztc.name                AS THERCLASS,
-                    zpc.name                AS PHARMCLASS,
-                    zps.name                AS PHARMSUBCLASS,
-                    cm.generic_name         AS GENERIC_NAME,
-                    em.department_id        AS DEPARTMENT_ID,
-                    cd.department_name      AS DEPARTMENT_NAME
-                FROM enc_meds em
-                INNER JOIN CLARITY_LH.CLARITY.ORDER_MED om            ON om.order_med_id = em.order_med_id
-                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_MEDICATION cm    ON om.medication_id = cm.medication_id
-                LEFT JOIN CLARITY_LH.CLARITY.MDL_MD_PRBLM_LIST mmpl   ON om.mdl_id = mmpl.med_prblm_list_id
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_ORDER_CLASS zoc       ON om.order_class_c = zoc.order_class_c
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_MED_UNIT zmu          ON om.hv_dose_unit_c = zmu.disp_qtyunit_c
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_ADMIN_ROUTE zar       ON om.med_route_c = zar.med_route_c
-                LEFT JOIN CLARITY_LH.CLARITY.IP_FREQUENCY ipf         ON om.hv_discr_freq_id = ipf.freq_id
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_THERA_CLASS ztc       ON cm.thera_class_c = ztc.thera_class_c
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_CLASS zpc       ON cm.pharm_class_c = zpc.pharm_class_c
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_SUBCLASS zps    ON cm.pharm_subclass_c = zps.pharm_subclass_c
-                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP cd           ON em.department_id = cd.department_id
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_ORDERING_MODE zom     ON om.ordering_mode_c = zom.ordering_mode_c
-            ) d
-        """,
-        "primary_keys": "",
-        "non_key_columns": "PAT_ID,PAT_MRN_ID,APPT_PRC_ID,APPT_STATUS_C,CONTACT_DATE,ENC_CLOSE_DATE,ORDER_MED_ID,ORDERING_DATE,FREQ_NAME,SIG,HV_DISCRETE_DOSE,MIN_DISCRETE_DOSE,MAX_DISCRETE_DOSE,QUANTITY,REFILLS,START_DATE,END_DATE,NAME,PAT_ENC_CSN_ID,IS_ACTIVE_YN,CRRNT_LONG_TERM_YN,ORDER_CLASS_C,ORDERING_MODE,MEDUNIT,ORDERCLASS,MEDROUTE,THERCLASS,PHARMCLASS,PHARMSUBCLASS,GENERIC_NAME,DEPARTMENT_ID,DEPARTMENT_NAME",
-        "identity_column": "ALLERGY_MEDS_KEY",
-        "load_type": "FULL",
-    },
-]
+-- Oracle
+SELECT COUNT(*) FROM ALLERGY.MV_ALLERGY_MEDS;
+SELECT COUNT(DISTINCT pat_id) FROM ALLERGY.MV_PAT_ID;
+
+-- Fabric
+SELECT COUNT(*), COUNT(DISTINCT ROW_HASH)
+FROM ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_MEDS WHERE IS_DELETED = 0;
+
+SELECT COUNT(DISTINCT PAT_ID) FROM (
+  SELECT PAT_ID, IS_DELETED, ROW_NUMBER() OVER (PARTITION BY ROW_HASH
+         ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC) rn
+  FROM ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID) t
+WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0;
