@@ -1,6 +1,113 @@
-SELECT PIPELINE_NAME, BATCH_ID, STATUS, BATCH_START_DTTM, BATCH_END_DTTM,
-       DATEDIFF(SECOND, BATCH_START_DTTM, BATCH_END_DTTM) AS DURATION_SEC,
-       CAST(DATEDIFF(SECOND, BATCH_START_DTTM, BATCH_END_DTTM) / 60.0 AS DECIMAL(10,2)) AS DURATION_MIN
-FROM ALLERGY_DELTA.ALLERGY_BATCHES
-WHERE BATCH_END_DTTM IS NOT NULL
-ORDER BY BATCH_START_DTTM DESC;
+# CONFIG_NB entry: TBL_ALLERGY_LABS_POP -> ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_POP
+#
+# Same logic and same result as the current query (transcribed from the
+# 2026-10-02 1.20 AM photos). Every join type, join condition, CASE and the
+# order_status_c filter are unchanged. Only performance changes:
+#
+#   1. pat_ids: DISTINCT pat_id from TBL_PAT_ID is used to cut PAT_ENC and
+#      PATIENT down to our patients FIRST (LEFT SEMI JOIN), so the heavy joins
+#      (PAT_ENC x ORDER_PROC x ORDER_RESULTS) run once per patient, not once
+#      per TBL_PAT_ID row.
+#   2. The original INNER JOIN to TBL_PAT_ID (all rows, NO IS_DELETED filter,
+#      same as today) is kept at the very end, so row counts and duplicates are
+#      exactly what the old query returns.
+#   3. ORDER_PROC is filtered on order_status_c before the join and reads only
+#      the columns used.
+#   4. BROADCAST hints on the small lookups: ZC_RESULT_STATUS, ZC_RESULT_FLAG,
+#      ZC_DISP_ENC_TYPE, CLARITY_DEP, CLARITY_COMPONENT.
+#
+# non_key_columns was cut off in the photo; rebuilt from the SELECT list, in order.
+# r.line has no alias in the original, so the column is LINE (kept as is).
+
+pipeline_configs = [
+    {
+        "pipeline_name": "TBL_ALLERGY_LABS_POP",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_POP",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            WITH pat_ids AS (
+                SELECT DISTINCT pat_id
+                FROM allergy_lh.allergy_delta.tbl_pat_id
+                WHERE pat_id IS NOT NULL
+            ),
+            pe AS (
+                SELECT e.pat_id, e.pat_enc_csn_id, e.appt_status_c, e.appt_prc_id,
+                       e.contact_date, e.enc_closed_yn, e.department_id, e.enc_type_c
+                FROM clarity_lh.clarity.pat_enc e
+                LEFT SEMI JOIN pat_ids p ON e.pat_id = p.pat_id
+            ),
+            pat AS (
+                SELECT pt.pat_id, pt.pat_mrn_id
+                FROM clarity_lh.clarity.patient pt
+                LEFT SEMI JOIN pat_ids p ON pt.pat_id = p.pat_id
+            ),
+            op AS (
+                SELECT o.pat_enc_csn_id, o.order_proc_id, o.proc_code,
+                       o.description, o.ordering_date
+                FROM clarity_lh.clarity.order_proc o
+                WHERE o.order_status_c IN (1, 2, 3, 5, 6, 9, 10, 11, 12)
+            ),
+            labs AS (
+                SELECT /*+ BROADCAST(cc, rs, d, zrf, zdet) */
+                    pat.pat_mrn_id          AS pat_mrn_id,
+                    pe.pat_id               AS pat_id,
+                    pe.pat_enc_csn_id       AS pat_enc_csn_id,
+                    pe.appt_status_c        AS appt_status_c,
+                    pe.appt_prc_id          AS appt_prc_id,
+                    zdet.name               AS enc_type_title,
+                    pe.contact_date         AS contact_date,
+                    d.department_name       AS department_name,
+                    op.order_proc_id        AS order_proc_id,
+                    op.proc_code            AS proc_code,
+                    op.description          AS description,
+                    op.ordering_date        AS ordering_date,
+                    r.result_time           AS result_time,
+                    r.result_date           AS result_date,
+                    r.component_id          AS component_id,
+                    cc.name                 AS componentname,
+                    r.ord_value             AS ord_value,
+                    r.ord_num_value         AS ord_num_value,
+                    r.reference_unit        AS reference_unit,
+                    r.reference_low         AS reference_low,
+                    r.reference_high        AS reference_high,
+                    zrf.name                AS result_flag,
+                    r.lab_status_c          AS lab_status_c,
+                    CASE
+                        WHEN r.lab_status_c = 3 THEN 'Final Result'
+                        WHEN r.lab_status_c = 4 THEN 'Edited'
+                    END                     AS lab_status,
+                    rs.name                 AS resultstatus,
+                    pe.enc_closed_yn        AS enc_closed_yn,
+                    r.ord_date_real         AS ord_date_real,
+                    r.ord_end_date_real     AS ord_end_date_real,
+                    r.line,
+                    pe.department_id        AS department_id
+                FROM pe
+                INNER JOIN pat
+                    ON pe.pat_id = pat.pat_id
+                INNER JOIN op
+                    ON pe.pat_enc_csn_id = op.pat_enc_csn_id
+                LEFT OUTER JOIN clarity_lh.clarity.order_results r
+                    ON op.order_proc_id = r.order_proc_id
+                LEFT OUTER JOIN clarity_lh.clarity.clarity_component cc
+                    ON r.component_id = cc.component_id
+                LEFT OUTER JOIN clarity_lh.clarity.zc_result_status rs
+                    ON r.result_status_c = rs.result_status_c
+                LEFT OUTER JOIN clarity_lh.clarity.clarity_dep d
+                    ON pe.department_id = d.department_id
+                LEFT OUTER JOIN clarity_lh.clarity.zc_result_flag zrf
+                    ON r.result_flag_c = zrf.result_flag_c
+                INNER JOIN clarity_lh.clarity.zc_disp_enc_type zdet
+                    ON pe.enc_type_c = zdet.disp_enc_type_c
+            )
+            SELECT l.*
+            FROM labs l
+            INNER JOIN (SELECT pat_id FROM allergy_lh.allergy_delta.tbl_pat_id) mvp
+                ON mvp.pat_id = l.pat_id
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_STATUS_C, APPT_PRC_ID, ENC_TYPE_TITLE, CONTACT_DATE, DEPARTMENT_NAME, ORDER_PROC_ID, PROC_CODE, DESCRIPTION, ORDERING_DATE, RESULT_TIME, RESULT_DATE, COMPONENT_ID, COMPONENTNAME, ORD_VALUE, ORD_NUM_VALUE, REFERENCE_UNIT, REFERENCE_LOW, REFERENCE_HIGH, RESULT_FLAG, LAB_STATUS_C, LAB_STATUS, RESULTSTATUS, ENC_CLOSED_YN, ORD_DATE_REAL, ORD_END_DATE_REAL, LINE, DEPARTMENT_ID",
+        "identity_column": "ALLERGY_LABS_POP_KEY",
+        "load_type": "FULL",
+    },
+]
