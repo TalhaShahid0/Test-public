@@ -29,6 +29,24 @@
 #      cleared between pipelines, optional pause and optional OPTIMIZE, and
 #      per-pipeline failure isolation.
 #
+# SPEED PASS (optimized/ copy, 2026-10-02) -- sync logic, row_hash, soft
+# deletes, keys and every ALLERGY_BATCHES value are unchanged:
+#   8. Fewer cached copies of the source. The keyed source is no longer a
+#      separate persisted copy (and neither is the _pid/_mid "base"): keys are
+#      a fixed projection of the already-cached source, so they come out the
+#      same every time it is read. Mode A: 3 cached copies -> 1. Mode B: 4 -> 2.
+#   9. Partition offsets for the surrogate key are collected to the driver
+#      (a few hundred numbers) instead of re-running a window on every read.
+#  10. SOURCE_RECORD_COUNT for identity pipelines comes from the counts the key
+#      step already computed -- no extra count() pass.
+#  11. PK validation: NULL check and duplicate check in ONE pass (was two).
+#  12. Stale-RUNNING guard and next BATCH_ID read in ONE query (was two), and
+#      the batch-table existence/schema check runs once per session.
+#  13. Thread-safe for parallel runs in one Spark session (ORCHESTRATOR_NB
+#      max_parallel): BATCH_ID allocation + RUNNING row, and every write to the
+#      batch table, happen under one lock, so two pipelines can never get the
+#      same BATCH_ID or collide on a Delta commit to ALLERGY_BATCHES.
+#
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
 # {
@@ -52,20 +70,22 @@
 #     1. Fewer cores per executor for the SAME memory, i.e. more memory per
 #        core (a wide join/window on a skewed key needs headroom per task):
 #          "executorCores": 2, "executorMemory": "28g", "numExecutors": 6
-#     2. Let this script's repartitioning spread the data more before it is
-#        cached -- pass a higher shuffle_partitions to
-#        configure_spark_for_efficiency(shuffle_partitions=400) if 137 keeps
-#        happening on one specific large/skewed target table.
+#     2. Partition counts are now sized automatically from the data (AQE +
+#        REBALANCE, ~128 MB per partition), so big tables get more partitions
+#        and small ones fewer with no per-table setting. Only if 137 keeps
+#        happening, lower advisory_partition_mb in
+#        configure_spark_for_efficiency (e.g. 64) for smaller partitions.
 # ============================================================================
 
 import time
+import threading
 from functools import reduce
 
 from pyspark import StorageLevel
 from pyspark.sql.functions import (
     col, lit, max as spark_max, coalesce, row_number, desc, broadcast,
     spark_partition_id, monotonically_increasing_id,
-    sum as spark_sum, count as spark_count,
+    sum as spark_sum, count as spark_count, when,
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, TimestampType
@@ -85,18 +105,30 @@ _PERSIST = StorageLevel.MEMORY_AND_DISK   # spill to disk instead of evicting
 # called CHANGE_TYPE broke the first version). It is never written to the target.
 CHG_TAG = "__sync_chg__"
 
+# One lock for everything that reads-then-writes the batch table (BATCH_ID
+# allocation) or commits to it. These are tiny, so serialising them costs
+# nothing, and it is what makes parallel pipelines in one session safe.
+_BATCH_LOCK = threading.RLock()
+_ENSURED_BATCH_TABLES = set()
+
 
 # ============================================================================
 # Spark configuration for lower CPU / shuffle pressure
 # ============================================================================
 
-def configure_spark_for_efficiency(broadcast_mb=100, shuffle_partitions=200):
+def configure_spark_for_efficiency(broadcast_mb=100, shuffle_partitions=2000,
+                                   advisory_partition_mb=128):
     """
     Runtime-settable tuning. Anything the runtime refuses is skipped quietly.
     (Executor count / cores / memory / native engine must be set in %%configure
     -- see the header. shuffle_partitions controls how finely a big shuffle is
     split; too few partitions on skewed/large data is a common cause of a
     single task outgrowing executor memory and getting OOM-killed (exit 137).)
+
+    AUTO-SIZING: shuffle_partitions is only the STARTING count. AQE coalesces
+    each shuffle down to ~advisory_partition_mb per partition, so a 300M-row
+    table keeps many partitions and a 10k-row table ends up with a handful.
+    Start high (2000) so big tables are never under-partitioned.
     """
     settings = {
         "spark.sql.adaptive.enabled": "true",
@@ -107,7 +139,10 @@ def configure_spark_for_efficiency(broadcast_mb=100, shuffle_partitions=200):
         # caught before a task grows large enough to OOM.
         "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "128m",
         "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "3",
-        "spark.sql.adaptive.advisoryPartitionSizeInBytes": "128m",
+        "spark.sql.adaptive.advisoryPartitionSizeInBytes": f"{advisory_partition_mb}m",
+        "spark.sql.adaptive.coalescePartitions.parallelismFirst": "false",
+        # Let AQE resize partitions of plans that are cached (persist) too.
+        "spark.sql.optimizer.canChangeCachedPlanOutputPartitioning": "true",
         "spark.sql.autoBroadcastJoinThreshold": str(broadcast_mb * 1024 * 1024),
         "spark.microsoft.delta.optimizeWrite.enabled": "true",
         "spark.sql.files.maxPartitionBytes": "134217728",
@@ -139,12 +174,15 @@ def _repartition_for_size(df, target_partitions=None):
     task on skewed input. Called on the staged source and on the target's
     latest-version DataFrame, the two large DataFrames this script caches.
 
-    Hash-repartitioning (not just coalesce/round-robin) is used so a run that
-    is skewed by a specific value (e.g. one dominant PAT_ID, or a NULL bucket)
-    gets spread across many partitions rather than funneled into one.
+    AUTO-SIZED: with no target_partitions, a REBALANCE hint is used instead of
+    a fixed repartition(n). AQE then picks the partition count from the actual
+    data size (~advisoryPartitionSizeInBytes each) and splits skewed ones, so
+    no per-table partition setting is needed. Row content/order semantics are
+    unchanged (it is still a plain round-robin redistribution).
     """
-    n = target_partitions or int(spark.conf.get("spark.sql.shuffle.partitions", "200"))
-    return df.repartition(n)
+    if target_partitions:
+        return df.repartition(target_partitions)
+    return df.hint("rebalance")
 
 
 def _split_cols(s):
@@ -208,23 +246,28 @@ def _add_sequential_key(df, name, start):
     """
     Adds `name` = start+1 .. start+N, in parallel (no single-partition window).
     Per-partition counts give each partition an offset; monotonically_increasing_id
-    gives the index inside the partition. Returns (keyed_df, persisted_base).
+    gives the index inside the partition. Returns (keyed_df, row_count).
+
+    `df` MUST be read from a persisted DataFrame (the staged source, or the
+    cached Mode B join). Its partitions and row order are then fixed, so
+    _pid/_mid -- and therefore the keys -- are identical on every read, and no
+    separate persisted copy is needed to "freeze" them. The per-partition
+    counts (one number per partition) are collected to the driver once.
     """
     base = (
         df.withColumn("_pid", spark_partition_id())
           .withColumn("_mid", monotonically_increasing_id())
-          .persist(_PERSIST)
     )
-    base.count()  # freeze partitioning / ids before deriving offsets
 
-    offsets = (
-        base.groupBy("_pid").agg(spark_count(lit(1)).alias("_cnt"))
-            .withColumn(
-                "_off",
-                spark_sum("_cnt").over(Window.orderBy("_pid")) - col("_cnt"),
-            )
-            .select("_pid", "_off")
+    counts = sorted(
+        (r["_pid"], r["_cnt"])
+        for r in base.groupBy("_pid").agg(spark_count(lit(1)).alias("_cnt")).collect()
     )
+    offset_rows, running = [], 0
+    for pid, cnt in counts:
+        offset_rows.append((int(pid), int(running)))
+        running += cnt
+    offsets = spark.createDataFrame(offset_rows, "_pid INT, _off LONG")
 
     keyed = (
         base.join(broadcast(offsets), "_pid")
@@ -236,7 +279,7 @@ def _add_sequential_key(df, name, start):
             )
             .drop("_pid", "_mid", "_off")
     )
-    return keyed, base
+    return keyed, running
 
 
 def _active_target_count(target_table):
@@ -477,6 +520,14 @@ BATCH_SCHEMA = StructType([
 
 
 def _ensure_batch_table(batch_table):
+    with _BATCH_LOCK:
+        if batch_table in _ENSURED_BATCH_TABLES:
+            return
+        _ensure_batch_table_once(batch_table)
+        _ENSURED_BATCH_TABLES.add(batch_table)
+
+
+def _ensure_batch_table_once(batch_table):
     if not spark.catalog.tableExists(batch_table):
         print("Batch table does not exist. Creating:", batch_table)
         spark.createDataFrame([], BATCH_SCHEMA) \
@@ -497,8 +548,9 @@ def _ensure_batch_table(batch_table):
 
 def _write_batch_row(batch_table, row_values):
     df = spark.createDataFrame([row_values], schema=BATCH_SCHEMA)
-    df.write.format("delta").mode("append") \
-        .option("mergeSchema", "true").saveAsTable(batch_table)
+    with _BATCH_LOCK:
+        df.write.format("delta").mode("append") \
+            .option("mergeSchema", "true").saveAsTable(batch_table)
 
 
 def _update_batch_row(batch_table, batch_id, updates: dict):
@@ -515,13 +567,14 @@ def _update_batch_row(batch_table, batch_id, updates: dict):
         schema=row_schema,
     )
     set_clause = {c: f"S.{c}" for c in cols if c != "BATCH_ID"}
-    (
-        DeltaTable.forName(spark, batch_table)
-        .alias("T")
-        .merge(row.alias("S"), "T.BATCH_ID = S.BATCH_ID")
-        .whenMatchedUpdate(set=set_clause)
-        .execute()
-    )
+    with _BATCH_LOCK:
+        (
+            DeltaTable.forName(spark, batch_table)
+            .alias("T")
+            .merge(row.alias("S"), "T.BATCH_ID = S.BATCH_ID")
+            .whenMatchedUpdate(set=set_clause)
+            .execute()
+        )
 
 
 # ============================================================================
@@ -575,17 +628,27 @@ def _validate_primary_keys(source_query, pk_cols, target_table):
     resolved = _resolve_cols(src, pk_cols, f"primary_keys for {target_table}")
 
     null_cond = reduce(lambda a, b: a | b, [col(c).isNull() for c in resolved])
-    if src.filter(null_cond).limit(1).count() > 0:
+
+    # One pass: group by the key once, then read both flags from the groups.
+    # (NULL keys form their own group, so has_null is the same answer as the
+    # old filter(...).limit(1) check, and max_cnt > 1 the same as the old
+    # duplicate check. NULL is still reported first, as before.)
+    chk = (
+        src.groupBy(*resolved).count()
+           .agg(
+               spark_max(when(null_cond, 1).otherwise(0)).alias("has_null"),
+               spark_max(col("count")).alias("max_cnt"),
+           )
+           .collect()[0]
+    )
+    if chk["has_null"] == 1:
         raise ValueError(
             f"{target_table}: primary_keys {resolved} contain NULLs in the source. "
             f"A NULL key cannot identify a row -- fix the source query or choose "
             f"a different key."
         )
 
-    dup = (
-        src.groupBy(*resolved).count().filter(col("count") > 1).limit(1).count()
-    )
-    if dup > 0:
+    if (chk["max_cnt"] or 0) > 1:
         raise ValueError(
             f"{target_table}: primary_keys {resolved} are not unique in the source. "
             f"Run a GROUP BY ... HAVING COUNT(*) > 1 on the source query to see the "
@@ -601,7 +664,8 @@ def _validate_primary_keys(source_query, pk_cols, target_table):
 
 def _assign_surrogate_keys(source_query, target_table, identity_column, pk_cols):
     """
-    Returns (effective_source_query, temp_view_name, cached_dfs, latest_df).
+    Returns (effective_source_query, temp_view_name, cached_dfs, latest_df,
+             source_count).
 
     Mode A (pk_cols empty) -- AUTO-INCREMENT
         Every source row gets a fresh key after the target's current max.
@@ -614,6 +678,9 @@ def _assign_surrogate_keys(source_query, target_table, identity_column, pk_cols)
     Fabric's Spark SQL rejects GENERATED ALWAYS AS IDENTITY, so this is PySpark.
     Key generation is now parallel (partition offsets) rather than a single
     partition window.
+
+    source_count is the exact row count of the returned source (same number
+    the old separate count() gave), taken from counts this step already does.
 
     CONCURRENCY: the max-key read is racy; the stale / concurrent batch guard in
     run_batch_tracked_merge is what prevents two runs allocating the same range.
@@ -648,8 +715,8 @@ def _assign_surrogate_keys(source_query, target_table, identity_column, pk_cols)
 
     if not pk_cols:
         # ---- Mode A -----------------------------------------------------------
-        result_df, base = _add_sequential_key(src_df, identity_column, max_key)
-        cached.append(base)
+        # src_df reads the persisted staged source, so keys are stable.
+        result_df, source_count = _add_sequential_key(src_df, identity_column, max_key)
     else:
         # ---- Mode B -----------------------------------------------------------
         resolved_pks = _resolve_cols(
@@ -683,19 +750,21 @@ def _assign_surrogate_keys(source_query, target_table, identity_column, pk_cols)
         existing_rows_df = joined_df.filter(col(identity_column).isNotNull())
         new_raw_df = joined_df.filter(col(identity_column).isNull()).drop(identity_column)
 
-        new_rows_df, base = _add_sequential_key(new_raw_df, identity_column, max_key)
-        cached.append(base)
+        # new_raw_df reads the persisted joined_df, so keys are stable.
+        new_rows_df, _ = _add_sequential_key(new_raw_df, identity_column, max_key)
 
         result_df = existing_rows_df.unionByName(new_rows_df)
+        # existing + new = every row of joined_df (cached; cheap count).
+        source_count = joined_df.count()
 
-    # result_df feeds the sync twice (upserts + soft_deletes); persist it.
-    result_df = result_df.persist(_PERSIST)
-    cached.append(result_df)
+    # result_df is NOT persisted again: it is a fixed projection of cached data
+    # (staged source / joined_df) plus a tiny broadcast offsets table, so each
+    # read gives the same rows and keys without a third full copy in memory.
 
     view_name = _safe_name("_stg_", target_table)
     result_df.createOrReplaceTempView(view_name)
 
-    return f"SELECT * FROM {view_name}", view_name, cached, latest_df
+    return f"SELECT * FROM {view_name}", view_name, cached, latest_df, source_count
 
 
 # ============================================================================
@@ -760,44 +829,52 @@ def run_batch_tracked_merge(
     latest_df = None
 
     try:
-        # ---- Step 0: guard against concurrent / stale runs ------------------
-        stale_running = (
-            spark.table(batch_table)
-            .filter((col("PIPELINE_NAME") == pipeline_name) & (col("STATUS") == "RUNNING"))
-            .count()
-        )
-        if stale_running > 0 and not allow_run_with_stale_running_batch:
-            raise RuntimeError(
-                f"Found {stale_running} batch(es) already RUNNING for pipeline "
-                f"'{pipeline_name}'. Refusing to start a new run. Investigate "
-                f"{batch_table}, or pass allow_run_with_stale_running_batch=True."
+        # ---- Step 0 + 1: stale guard and next batch id, ONE query ---------
+        # Held under _BATCH_LOCK together with the RUNNING row write below, so
+        # parallel pipelines can never be handed the same BATCH_ID.
+        _BATCH_LOCK.acquire()
+        try:
+            chk = (
+                spark.table(batch_table)
+                .agg(
+                    spark_sum(
+                        when((col("PIPELINE_NAME") == pipeline_name)
+                             & (col("STATUS") == "RUNNING"), 1).otherwise(0)
+                    ).alias("STALE_RUNNING"),
+                    coalesce(spark_max(col("BATCH_ID")), lit(0)).alias("MAX_BATCH_ID"),
+                )
+                .collect()[0]
             )
+            stale_running = chk["STALE_RUNNING"] or 0
+            if stale_running > 0 and not allow_run_with_stale_running_batch:
+                raise RuntimeError(
+                    f"Found {stale_running} batch(es) already RUNNING for pipeline "
+                    f"'{pipeline_name}'. Refusing to start a new run. Investigate "
+                    f"{batch_table}, or pass allow_run_with_stale_running_batch=True."
+                )
 
-        # ---- Step 1: batch id -----------------------------------------------
-        batch_id = (
-            spark.table(batch_table)
-            .agg(coalesce(spark_max(col("BATCH_ID")), lit(0)).alias("MAX_BATCH_ID"))
-            .collect()[0]["MAX_BATCH_ID"] + 1
-        )
-        batch_start = datetime.now()
+            batch_id = chk["MAX_BATCH_ID"] + 1
+            batch_start = datetime.now()
 
-        mode = "natural-key" if pk_cols else "full-row-hash"
+            mode = "natural-key" if pk_cols else "full-row-hash"
 
-        print("=" * 60)
-        print("STARTING PIPELINE:", pipeline_name)
-        print("Batch ID     :", batch_id)
-        print("Target Table :", target_table)
-        print("Match Mode   :", mode)
-        print("Batch Start  :", batch_start)
-        print("=" * 60)
+            print("=" * 60)
+            print("STARTING PIPELINE:", pipeline_name)
+            print("Batch ID     :", batch_id)
+            print("Target Table :", target_table)
+            print("Match Mode   :", mode)
+            print("Batch Start  :", batch_start)
+            print("=" * 60)
 
-        # ---- Step 2: RUNNING batch row --------------------------------------
-        _write_batch_row(batch_table, [
-            batch_id, pipeline_name, target_table, load_type,
-            batch_start, None, "RUNNING",
-            None, None, None, None, None, None,
-            created_by,
-        ])
+            # ---- Step 2: RUNNING batch row ----------------------------------
+            _write_batch_row(batch_table, [
+                batch_id, pipeline_name, target_table, load_type,
+                batch_start, None, "RUNNING",
+                None, None, None, None, None, None,
+                created_by,
+            ])
+        finally:
+            _BATCH_LOCK.release()
 
         # ---- Step 3a: stage the source ONCE ---------------------------------
         staged_query, src_view, src_df = _stage_source(source_query, target_table)
@@ -810,9 +887,11 @@ def run_batch_tracked_merge(
 
         effective_source_query = staged_query
         effective_non_key_columns = non_key_columns
+        source_count = None
 
         if identity_column:
-            effective_source_query, key_view, key_cached, latest_df = _assign_surrogate_keys(
+            (effective_source_query, key_view, key_cached, latest_df,
+             source_count) = _assign_surrogate_keys(
                 staged_query, target_table, identity_column, pk_cols
             )
             temp_views.append(key_view)
@@ -836,8 +915,10 @@ def run_batch_tracked_merge(
 
         _create_target_table_if_missing(target_table, effective_source_query)
 
-        # ---- Step 4: source count (cached, so cheap) ------------------------
-        source_count = spark.sql(effective_source_query).count()
+        # ---- Step 4: source count -----------------------------------------
+        # Identity pipelines already have it from the key step (same number).
+        if source_count is None:
+            source_count = spark.sql(effective_source_query).count()
         print("Source Record Count:", source_count)
 
         # ---- Step 5: execute the sync ---------------------------------------
