@@ -1,13 +1,1 @@
-%%configure
-{
-  "driverCores": 4, "driverMemory": "28g",
-  "executorCores": 4, "executorMemory": "28g",
-  "numExecutors": 4,
-  "conf": {
-    "spark.dynamicAllocation.enabled": "true",
-    "spark.dynamicAllocation.minExecutors": "1",
-    "spark.dynamicAllocation.maxExecutors": "4",
-    "spark.native.enabled": "true",
-    "spark.scheduler.mode": "FAIR"
-  }
-}
+@not(equals(activity('Run Orchestrator').output.result.exitValue, 'STOPPED_TIME_LIMIT'))
