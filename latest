@@ -1,1 +1,823 @@
-@not(equals(activity('Run Orchestrator').output.result.exitValue, 'STOPPED_TIME_LIMIT'))
+# ============================================================
+# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v3
+#
+# Requires MERGE_NB (%run it first) -- it uses
+# run_batch_tracked_merge() and configure_spark_for_efficiency().
+#
+# Same as the previous (sequential) orchestrator, plus a fix for
+# JOB_REACHED_MAX_LIFETIME ("Livy session ... cancelled because of
+# reaching configured 4 hours lifetime"). The sync itself
+# (run_batch_tracked_merge / deltaUpsertAndSync) and the pipeline order
+# are unchanged; the log tables only get new columns.
+#
+#   A. TIME BOX. The clock is the Spark session's age. Before starting a
+#      pipeline (or a retry) the orchestrator checks:
+#        1. elapsed < start_cutoff_hours (default 3): after 3 hours no NEW
+#           pipeline starts. The one already running keeps going and
+#           finishes in the 3h-4h window.
+#        2. elapsed + expected time must end before
+#           session_limit_hours (4) - safety_margin_minutes (10).
+#           expected time = the longest of the pipeline's recent runs
+#           (SUCCESS attempts in ALLERGY_ETL_STEP_LOG, SUCCESS batches in
+#           the batch table, and how long it had run when a session was
+#           killed under it) x duration_safety_factor (1.25).
+#           Never succeeded yet -> unknown_duration_minutes (90).
+#      The first pipeline of a run in a fresh session (up for less than
+#      fresh_session_minutes, 30) always starts: a new session cannot do
+#      better. If a check fails the run STOPS CLEANLY before that
+#      pipeline: nothing is left RUNNING, the run row gets
+#      STATUS = 'STOPPED_TIME_LIMIT' and the pipelines not yet run go in
+#      PENDING_PIPELINE_NAMES. Pipelines are never reordered or skipped
+#      past (a later pipeline may read an earlier one's target).
+#
+#   B. RESUME (resume=True, default). If the previous run ended a short
+#      while ago (resume_gap_minutes, default 60) without a full SUCCESS --
+#      stopped at the time limit, killed with its session, or a pipeline
+#      failed -- the new run skips the pipelines that already SUCCEEDED in
+#      that chain of runs and does only the rest. A skipped pipeline that
+#      depends on one that runs again (reads its target, same target, or
+#      cfg["depends_on"]) runs again too, after it. A full SUCCESS ends the
+#      chain, and so does a long gap: the next scheduled run does
+#      everything.
+#
+#   C. AUTO CLEANUP of killed sessions (stale_after_hours, default =
+#      session_limit_hours; None turns it off).
+#        - ALLERGY_ETL_RUN_LOG: a RUNNING row whose Spark session started
+#          more than session_limit_hours ago cannot be alive -> ABANDONED.
+#          (Rows from before SESSION_START_DTTM existed use RUN_START_DTTM.)
+#        - <batch_table>: the orchestrator tags its batches
+#          (CREATED_BY = 'Fabric Notebook | ORCH_RUN_ID=<n>'). A RUNNING
+#          batch whose run <n> is no longer RUNNING is dead -> FAILED, with
+#          BATCH_END_DTTM = when that session died. Untagged RUNNING rows
+#          (older runs, manual calls) are closed only once they are older
+#          than stale_after_hours, as before. A live batch is never closed.
+#
+#   D. A time-limit stop does NOT raise (it is planned, the next round
+#      resumes). A pipeline that failed in a round that stopped at the time
+#      limit is retried first in the next round. Real failures raise at
+#      the end of the last round (raise_on_failure=True), as before. A round
+#      that would stop for time without finishing any new pipeline (its
+#      first pipeline failed) raises instead, so the loop cannot repeat the
+#      same round forever.
+#
+#   E. AUTO-CONTINUE. The last cell exits the notebook with the run STATUS
+#      (notebookutils.notebook.exit), so a Data pipeline "Until" loop around
+#      this notebook starts a fresh session while the exit value is
+#      'STOPPED_TIME_LIMIT'.
+# ============================================================
+
+import re
+import time
+from datetime import datetime, timedelta
+from delta.tables import DeltaTable
+from pyspark.sql.types import (
+    StructType, StructField, LongType, StringType,
+    TimestampType, IntegerType, DoubleType,
+)
+from pyspark.sql.functions import (
+    coalesce, max as spark_max, col, lit, row_number, unix_timestamp,
+)
+from pyspark.sql.window import Window
+
+try:
+    from pyspark.errors import AnalysisException
+except Exception:  # older runtimes
+    from pyspark.sql.utils import AnalysisException
+
+# Errors that will fail the same way on a retry.
+NON_TRANSIENT_ERRORS = (ValueError, RuntimeError, AnalysisException)
+
+# ERROR_MESSAGE prefix of batch rows closed because their session was killed.
+# For these rows BATCH_END_DTTM - BATCH_START_DTTM = how long the pipeline had
+# run when it was killed (a lower bound of its real duration).
+KILLED_BATCH_PREFIX = "SESSION_KILLED:"
+
+
+# ============================================================
+# Monitoring table schemas
+# ============================================================
+
+ORCHESTRATION_RUN_SCHEMA = StructType([
+    StructField("RUN_ID", LongType(), True),
+    StructField("RUN_START_DTTM", TimestampType(), True),
+    StructField("RUN_END_DTTM", TimestampType(), True),
+    StructField("STATUS", StringType(), True),    # RUNNING / SUCCESS / PARTIAL_FAILURE / FAILED / ABANDONED / STOPPED_TIME_LIMIT
+    StructField("TOTAL_PIPELINES", LongType(), True),
+    StructField("SUCCEEDED_COUNT", LongType(), True),
+    StructField("FAILED_COUNT", LongType(), True),
+    StructField("FAILED_PIPELINE_NAMES", StringType(), True),     # comma-joined
+    StructField("TRIGGERED_BY", StringType(), True),
+    StructField("PENDING_PIPELINE_NAMES", StringType(), True),    # not run because of the time limit
+    StructField("SKIPPED_DONE_PIPELINE_NAMES", StringType(), True),  # skipped by resume (already done)
+    StructField("SESSION_START_DTTM", TimestampType(), True),     # NEW (v3): when this run's Spark session started
+])
+
+ORCHESTRATION_ATTEMPT_SCHEMA = StructType([
+    StructField("RUN_ID", LongType(), True),                      # FK -> RUN_TABLE.RUN_ID
+    StructField("PIPELINE_NAME", StringType(), True),
+    StructField("ATTEMPT_NUMBER", IntegerType(), True),
+    StructField("ATTEMPT_START_DTTM", TimestampType(), True),
+    StructField("ATTEMPT_END_DTTM", TimestampType(), True),
+    StructField("STATUS", StringType(), True),                    # SUCCESS / FAILED
+    StructField("ERROR_MESSAGE", StringType(), True),
+    StructField("DURATION_SECONDS", DoubleType(), True),
+    StructField("BATCH_ID", LongType(), True),                    # FK -> <batch_table>.BATCH_ID, set only on SUCCESS
+])
+
+RUN_TABLE = "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_ETL_RUN_LOG"
+ATTEMPT_TABLE = "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_ETL_STEP_LOG"
+
+
+# ============================================================
+# Small table helpers
+# ============================================================
+
+def _ensure_table(table, schema):
+    if not spark.catalog.tableExists(table):
+        print("Monitoring table does not exist. Creating:", table)
+        spark.createDataFrame([], schema) \
+            .write.format("delta").mode("overwrite").saveAsTable(table)
+        print("Monitoring table created successfully.")
+        return
+
+    existing_cols = {f.name for f in spark.table(table).schema.fields}
+    missing_fields = [f for f in schema.fields if f.name not in existing_cols]
+    if missing_fields:
+        add_cols_ddl = ", ".join(
+            f"{f.name} {f.dataType.simpleString()}" for f in missing_fields
+        )
+        print(f"Monitoring table is missing columns [{add_cols_ddl}]. Altering:", table)
+        spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({add_cols_ddl})")
+
+
+def _append_row(table, schema, row_values):
+    spark.createDataFrame([row_values], schema=schema) \
+        .write.format("delta").mode("append") \
+        .option("mergeSchema", "true").saveAsTable(table)
+
+
+def _update_run_row(run_id, updates: dict):
+    """MERGE-based update of one RUN_TABLE row; schema built in the same
+    order as the dict keys so values never zip against wrong-typed fields."""
+    updates_with_id = dict(updates)
+    updates_with_id["RUN_ID"] = run_id
+    cols = list(updates_with_id.keys())
+
+    field_lookup = {f.name: f for f in ORCHESTRATION_RUN_SCHEMA.fields}
+    row_schema = StructType([field_lookup[c] for c in cols])
+
+    row = spark.createDataFrame(
+        [[updates_with_id[c] for c in cols]],
+        schema=row_schema,
+    )
+    set_clause = {c: f"S.{c}" for c in cols if c != "RUN_ID"}
+    (
+        DeltaTable.forName(spark, RUN_TABLE)
+        .alias("T")
+        .merge(row.alias("S"), "T.RUN_ID = S.RUN_ID")
+        .whenMatchedUpdate(set=set_clause)
+        .execute()
+    )
+
+
+def _next_run_id():
+    if not spark.catalog.tableExists(RUN_TABLE):
+        return 1
+    return (
+        spark.table(RUN_TABLE)
+        .agg(coalesce(spark_max("RUN_ID"), lit(0)).alias("m"))
+        .collect()[0]["m"] + 1
+    )
+
+
+def _recent_runs(limit=200):
+    """Latest run rows, newest first, as plain dicts."""
+    return [
+        r.asDict()
+        for r in (
+            spark.table(RUN_TABLE)
+            .select("RUN_ID", "RUN_START_DTTM", "RUN_END_DTTM", "STATUS",
+                    "SESSION_START_DTTM")
+            .orderBy(col("RUN_ID").desc())
+            .limit(limit)
+            .collect()
+        )
+    ]
+
+
+def _session_death(run, dead_after_hours):
+    """Latest moment the session of `run` can have been alive."""
+    start = run["SESSION_START_DTTM"] or run["RUN_START_DTTM"]
+    return None if start is None else start + timedelta(hours=dead_after_hours)
+
+
+def _close_dead_runs(dead_after_hours):
+    """RUNNING run rows whose Spark session cannot be alive any more
+    (session older than its max lifetime) -> ABANDONED."""
+    now = datetime.now()
+    # lit(<python datetime>) is converted exactly like the stored values
+    # (no dependency on spark.sql.session.timeZone, unlike a TIMESTAMP'..' literal).
+    cut = now - timedelta(hours=dead_after_hours)
+    DeltaTable.forName(spark, RUN_TABLE).update(
+        condition=(
+            (col("STATUS") == "RUNNING")
+            & (coalesce(col("SESSION_START_DTTM"), col("RUN_START_DTTM")) < lit(cut))
+        ),
+        set={"STATUS": lit("ABANDONED"), "RUN_END_DTTM": lit(now)},
+    )
+
+
+def _orch_tag(run_id):
+    return f"ORCH_RUN_ID={run_id}"
+
+
+def _close_dead_batches(batch_tables, pipeline_names, dead_after_hours):
+    """Close RUNNING batch rows of these pipelines that no live session owns:
+      - row written by this orchestrator (CREATED_BY carries ORCH_RUN_ID=<n>):
+        closed when run <n> is no longer RUNNING (it was killed / interrupted);
+      - any other row (older runs, manual run_batch_tracked_merge calls):
+        closed only when it is older than dead_after_hours (no session lives
+        that long).
+    If the owning run was killed with its session (ABANDONED), the row gets
+    KILLED_BATCH_PREFIX and BATCH_END_DTTM = when that session died, so
+    END - START is how long the pipeline had run when it was killed (used as a
+    lower bound of its duration). Otherwise it gets 'LEFT_RUNNING:' and is not
+    used for duration estimates."""
+    now = datetime.now()
+    runs = _recent_runs(limit=500)
+    by_id = {r["RUN_ID"]: r for r in runs}
+    by_start = sorted(
+        (r for r in runs if r["RUN_START_DTTM"] is not None),
+        key=lambda r: r["RUN_START_DTTM"],
+    )
+    age_cut = now - timedelta(hours=dead_after_hours)
+
+    for bt in batch_tables:
+        if not spark.catalog.tableExists(bt):
+            continue
+        running = (
+            spark.table(bt)
+            .filter((col("STATUS") == "RUNNING")
+                    & col("PIPELINE_NAME").isin(list(pipeline_names)))
+            .select("BATCH_ID", "PIPELINE_NAME", "BATCH_START_DTTM", "CREATED_BY")
+            .collect()
+        )
+
+        fixes = []
+        for d in running:
+            bs = d["BATCH_START_DTTM"]
+            m = re.search(r"ORCH_RUN_ID=(\d+)", d["CREATED_BY"] or "")
+            if m:
+                owner = by_id.get(int(m.group(1)))
+                if owner is not None and owner["STATUS"] == "RUNNING":
+                    continue                      # its run may still be alive
+            if not m or owner is None:
+                if bs is None or bs >= age_cut:
+                    continue                      # not provably dead
+                if not m:
+                    cands = [r for r in by_start if r["RUN_START_DTTM"] <= bs]
+                    owner = cands[-1] if cands else None   # best guess, estimate only
+
+            died, prefix = now, "LEFT_RUNNING:"
+            if owner is not None and owner["STATUS"] == "ABANDONED" and bs is not None:
+                death = _session_death(owner, dead_after_hours)
+                if death is not None and bs <= death <= now:
+                    died, prefix = death, KILLED_BATCH_PREFIX
+            elif (owner is not None and m and owner["RUN_END_DTTM"] is not None
+                  and bs is not None and bs <= owner["RUN_END_DTTM"] <= now):
+                died = owner["RUN_END_DTTM"]
+
+            if prefix == KILLED_BATCH_PREFIX:
+                msg = (f"{prefix} still RUNNING when its Spark session was killed "
+                       f"(had run about {(died - bs).total_seconds() / 60:.0f} min); "
+                       f"closed by orchestrator cleanup")
+            else:
+                msg = (f"{prefix} still RUNNING after its run ended; "
+                       f"closed by orchestrator cleanup")
+            fixes.append((d["BATCH_ID"], died, msg))
+            print(f"Cleanup: {bt} BATCH_ID {d['BATCH_ID']} ({d['PIPELINE_NAME']}) "
+                  f"RUNNING -> FAILED [{prefix}]")
+
+        if not fixes:
+            continue
+        src = spark.createDataFrame(
+            fixes, "BATCH_ID long, END_DTTM timestamp, MSG string")
+        (
+            DeltaTable.forName(spark, bt)
+            .alias("T")
+            .merge(src.alias("S"), "T.BATCH_ID = S.BATCH_ID AND T.STATUS = 'RUNNING'")
+            .whenMatchedUpdate(set={
+                "STATUS": lit("FAILED"),
+                "BATCH_END_DTTM": col("S.END_DTTM"),
+                "ERROR_MESSAGE": col("S.MSG"),
+            })
+            .execute()
+        )
+
+
+def _already_done_pipelines(resume_gap_minutes, resume_window_hours,
+                            dead_after_hours, now):
+    """Pipelines whose LATEST attempt in the chain of runs just before this one
+    is a SUCCESS, as {name: (start, end) of that attempt}.
+    Walking back from the newest run, a run joins the chain while it is not a
+    full SUCCESS and it ended at most resume_gap_minutes before the next run
+    started. (An ABANDONED run 'ended' when its session died.)"""
+    if not spark.catalog.tableExists(RUN_TABLE):
+        return {}, []
+
+    since = now - timedelta(hours=resume_window_hours)
+    gap = timedelta(minutes=resume_gap_minutes)
+
+    chain = []
+    next_start = now
+    for r in _recent_runs(limit=50):
+        if r["STATUS"] in ("RUNNING", "SUCCESS"):
+            break
+        if r["RUN_START_DTTM"] is None or r["RUN_START_DTTM"] < since:
+            break
+        end = r["RUN_END_DTTM"]
+        if r["STATUS"] == "ABANDONED":
+            death = _session_death(r, dead_after_hours) if dead_after_hours else None
+            if death is not None and (end is None or death < end):
+                end = death
+        if end is None or next_start - end > gap:
+            break
+        chain.append(r["RUN_ID"])
+        next_start = r["RUN_START_DTTM"]
+
+    if not chain:
+        return {}, []
+
+    latest = {}
+    for r in (
+        spark.table(ATTEMPT_TABLE)
+        .filter(col("RUN_ID").isin(chain))
+        .select("PIPELINE_NAME", "STATUS", "ATTEMPT_START_DTTM", "ATTEMPT_END_DTTM")
+        .collect()
+    ):
+        k, st = r["PIPELINE_NAME"], r["ATTEMPT_START_DTTM"]
+        if st is not None and (k not in latest or st > latest[k]["ATTEMPT_START_DTTM"]):
+            latest[k] = r
+    done = {
+        k: (r["ATTEMPT_START_DTTM"], r["ATTEMPT_END_DTTM"])
+        for k, r in latest.items()
+        if r["STATUS"] == "SUCCESS" and r["ATTEMPT_END_DTTM"] is not None
+    }
+    return done, chain
+
+
+def _recent_durations(names, batch_tables, history=5):
+    """Longest recent run time (seconds) per pipeline, from:
+      - its last `history` SUCCESS attempts in ATTEMPT_TABLE,
+      - its last `history` SUCCESS or session-killed batches in the batch
+        tables (a killed batch counts with the time it had run when killed).
+    Pipelines with no history are missing from the result."""
+    names = list(names)
+    out = {}
+
+    def take(rows):
+        for r in rows:
+            if r["d"] is not None:
+                out[r["PIPELINE_NAME"]] = max(out.get(r["PIPELINE_NAME"], 0.0),
+                                              float(r["d"]))
+
+    w = Window.partitionBy("PIPELINE_NAME").orderBy(col("ATTEMPT_END_DTTM").desc())
+    take(
+        spark.table(ATTEMPT_TABLE)
+        .filter((col("STATUS") == "SUCCESS") & col("PIPELINE_NAME").isin(names))
+        .withColumn("rn", row_number().over(w))
+        .filter(col("rn") <= history)
+        .groupBy("PIPELINE_NAME")
+        .agg(spark_max("DURATION_SECONDS").alias("d"))
+        .collect()
+    )
+
+    wb = Window.partitionBy("PIPELINE_NAME").orderBy(col("BATCH_ID").desc())
+    for bt in batch_tables:
+        if not spark.catalog.tableExists(bt):
+            continue
+        take(
+            spark.table(bt)
+            .filter(
+                col("PIPELINE_NAME").isin(names)
+                & col("BATCH_START_DTTM").isNotNull()
+                & col("BATCH_END_DTTM").isNotNull()
+                & (
+                    (col("STATUS") == "SUCCESS")
+                    | ((col("STATUS") == "FAILED")
+                       & col("ERROR_MESSAGE").startswith(KILLED_BATCH_PREFIX))
+                )
+            )
+            .withColumn("rn", row_number().over(wb))
+            .filter(col("rn") <= history)
+            .withColumn("d", unix_timestamp("BATCH_END_DTTM")
+                        - unix_timestamp("BATCH_START_DTTM"))
+            .groupBy("PIPELINE_NAME")
+            .agg(spark_max("d").alias("d"))
+            .collect()
+        )
+    return out
+
+
+def _reads_table(source_query, table):
+    """True if source_query mentions `table` (last name part, whole word, any
+    case). Same rule as optimized/ORCHESTRATOR_NB.py."""
+    short = table.strip().strip("`").split(".")[-1].strip("`")
+    pattern = r"(?<![A-Za-z0-9_])" + re.escape(short) + r"(?![A-Za-z0-9_])"
+    return re.search(pattern, source_query or "", flags=re.IGNORECASE) is not None
+
+
+def _depends_on_earlier(pipeline_configs):
+    """{j: set(i < j)} -- config j is tied to an earlier config i when one reads
+    the other's target, both write the same target, or cfg["depends_on"] names
+    it. Used so that when i runs again, j runs again after it (as in one
+    uninterrupted run)."""
+    index_of = {c["pipeline_name"]: k for k, c in enumerate(pipeline_configs)}
+    deps = {}
+    for j, cj in enumerate(pipeline_configs):
+        deps[j] = set()
+        for i in range(j):
+            ci = pipeline_configs[i]
+            if (ci["target_table"].strip().lower() == cj["target_table"].strip().lower()
+                    or _reads_table(cj.get("source_query"), ci["target_table"])
+                    or _reads_table(ci.get("source_query"), cj["target_table"])):
+                deps[j].add(i)
+        for dname in cj.get("depends_on", []) or []:
+            if dname in index_of and index_of[dname] < j:
+                deps[j].add(index_of[dname])
+    return deps
+
+
+def _merge_args(cfg, run_id):
+    """Config for run_batch_tracked_merge: orchestrator-only keys removed and
+    the run id added to CREATED_BY, so cleanup knows which run owns a batch."""
+    args = {k: v for k, v in cfg.items() if k != "depends_on"}
+    args["created_by"] = f"{args.get('created_by', 'Fabric Notebook')} | {_orch_tag(run_id)}"
+    return args
+
+
+def _fmt_min(seconds):
+    return "unknown" if seconds is None else f"{seconds / 60:.0f} min"
+
+
+# ============================================================
+# Orchestrator entry point
+# ============================================================
+
+def run_orchestrator(
+    pipeline_configs,
+    triggered_by="Scheduled",
+    max_attempts=2,
+    inter_attempt_wait_seconds=15,
+    inter_pipeline_wait_seconds=0,
+    allow_run_with_stale_running_run=False,
+    retry_non_transient=False,
+    stale_after_hours="auto",
+    raise_on_failure=True,
+    tune_spark=True,
+    session_limit_hours=4.0,
+    start_cutoff_hours=3.0,
+    safety_margin_minutes=10,
+    duration_safety_factor=1.25,
+    unknown_duration_minutes=90,
+    fresh_session_minutes=30,
+    resume=True,
+    resume_gap_minutes=60,
+    resume_window_hours=24,
+):
+    """
+    Runs every config through run_batch_tracked_merge(), one at a time, with
+    retry, logging:
+      - one RUN_TABLE row for the whole notebook execution
+      - one ATTEMPT_TABLE row per attempt per pipeline, linked to the
+        pipeline's own batch_table.BATCH_ID on success
+
+    session_limit_hours: the Spark session's max lifetime (the "configured N
+    hours lifetime" in JOB_REACHED_MAX_LIFETIME). Keep it equal to the real
+    lifetime. None disables the time box. See header A for the start rules.
+
+    resume=True: continue the previous run chain (header B).
+
+    stale_after_hours="auto" = session_limit_hours: cleanup of killed
+    sessions (header C). None turns the cleanup off.
+
+    STALE-RUN GUARD: refuses to start if another RUN_TABLE row is still
+    STATUS = 'RUNNING' (after the cleanup). Override with
+    allow_run_with_stale_running_run=True.
+    """
+    # Count from when the Spark session started (the lifetime clock), not from
+    # this call: %run MERGE_NB / CONFIG_NB and earlier cells already used some.
+    try:
+        session_start = datetime.fromtimestamp(spark.sparkContext.startTime / 1000.0)
+    except Exception:
+        session_start = datetime.now()
+
+    budget_seconds = (
+        None if session_limit_hours is None
+        else session_limit_hours * 3600 - safety_margin_minutes * 60
+    )
+    cutoff_seconds = (
+        None if session_limit_hours is None or start_cutoff_hours is None
+        else start_cutoff_hours * 3600
+    )
+
+    def elapsed():
+        return (datetime.now() - session_start).total_seconds()
+
+    def fits(expected_seconds):
+        if budget_seconds is None:
+            return True
+        if cutoff_seconds is not None and elapsed() >= cutoff_seconds:
+            return False
+        return elapsed() + expected_seconds <= budget_seconds
+
+    if stale_after_hours == "auto":
+        stale_after_hours = session_limit_hours
+
+    if tune_spark:
+        configure_spark_for_efficiency()   # defined in MERGE_NB
+
+    _ensure_table(RUN_TABLE, ORCHESTRATION_RUN_SCHEMA)
+    _ensure_table(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA)
+
+    batch_tables = sorted({c["batch_table"] for c in pipeline_configs})
+    all_names = [c["pipeline_name"] for c in pipeline_configs]
+
+    # ---- Cleanup of killed runs, then stale-run guard ----
+    if stale_after_hours is not None:
+        _close_dead_runs(stale_after_hours)
+
+    stale_running = (
+        spark.table(RUN_TABLE)
+        .filter(col("STATUS") == "RUNNING")
+        .count()
+    )
+    if stale_running > 0 and not allow_run_with_stale_running_run:
+        raise RuntimeError(
+            f"Found {stale_running} orchestrator run(s) already RUNNING in "
+            f"{RUN_TABLE}. Refusing to start a new run to avoid a RUN_ID "
+            f"collision / interleaved attempt rows with that run. "
+            f"Investigate {RUN_TABLE}, or pass "
+            f"allow_run_with_stale_running_run=True."
+        )
+
+    # No orchestrator run is alive, so RUNNING batch rows are leftovers of a
+    # killed session (they would trip run_batch_tracked_merge's own guard).
+    if stale_after_hours is not None and stale_running == 0:
+        _close_dead_batches(batch_tables, all_names, stale_after_hours)
+
+    # ---- Resume: which pipelines are already done ----
+    run_start = datetime.now()
+    done_info, resumed_from = (
+        _already_done_pipelines(resume_gap_minutes, resume_window_hours,
+                                stale_after_hours, run_start)
+        if resume else ({}, [])
+    )
+    # A done pipeline must run again (after its upstream, in config order) if a
+    # pipeline it depends on runs again now, or succeeded again after it did --
+    # so nothing keeps data built on an old input.
+    redo = set()
+    if done_info:
+        deps = _depends_on_earlier(pipeline_configs)
+        rerun_idx = set()
+        for j, c in enumerate(pipeline_configs):
+            n = c["pipeline_name"]
+            stale = False
+            if n in done_info:
+                for i in deps[j]:
+                    ni = pipeline_configs[i]["pipeline_name"]
+                    if i in rerun_idx or (
+                        ni in done_info and done_info[ni][1] > done_info[n][0]
+                    ):
+                        stale = True
+                        break
+            if n not in done_info or stale:
+                rerun_idx.add(j)
+                if n in done_info:
+                    redo.add(n)
+    done_names = set(done_info) - redo
+    to_run = [c for c in pipeline_configs if c["pipeline_name"] not in done_names]
+    skipped_done = [c["pipeline_name"] for c in pipeline_configs
+                    if c["pipeline_name"] in done_names]
+
+    # ---- Expected time per pipeline ----
+    history = (
+        _recent_durations([c["pipeline_name"] for c in to_run], batch_tables)
+        if to_run and budget_seconds is not None else {}
+    )
+    expected = {
+        c["pipeline_name"]: (
+            history[c["pipeline_name"]] * duration_safety_factor
+            if c["pipeline_name"] in history
+            else unknown_duration_minutes * 60
+        )
+        for c in to_run
+    }
+
+    run_id = _next_run_id()
+
+    print("=============================================")
+    print("STARTING ORCHESTRATOR RUN")
+    print("Run ID       :", run_id)
+    print("Run Start    :", run_start)
+    print("Pipelines    :", len(pipeline_configs))
+    if budget_seconds is not None:
+        print("Session up   :", _fmt_min(elapsed()), "(since", session_start, ")")
+        print("New starts   : until", _fmt_min(cutoff_seconds),
+              f"| must end by {_fmt_min(budget_seconds)} "
+              f"(session limit {session_limit_hours}h - {safety_margin_minutes} min)")
+    if skipped_done:
+        print(f"Resuming     : runs {resumed_from} -- skipping {len(skipped_done)} "
+              f"already done: {skipped_done}")
+    if redo:
+        print(f"Run again    : {sorted(redo)} (they depend on a pipeline that runs again)")
+    print("To run       :", len(to_run))
+    if budget_seconds is not None:
+        for c in to_run:
+            n = c["pipeline_name"]
+            src = "history x factor" if n in history else "no history yet"
+            print(f"   {n:<40} expected {_fmt_min(expected[n])} ({src})")
+    print("=============================================")
+
+    _append_row(RUN_TABLE, ORCHESTRATION_RUN_SCHEMA, [
+        run_id, run_start, None, "RUNNING",
+        len(pipeline_configs), 0, 0, None,
+        triggered_by, None,
+        ",".join(skipped_done) if skipped_done else None,
+        session_start,
+    ])
+
+    results = {}
+    failed_pipelines = []
+    pending = []          # not run because of the time limit
+
+    try:
+        for i, cfg in enumerate(to_run):
+            name = cfg["pipeline_name"]
+            exp = expected[name]
+
+            # The first pipeline of a FRESH session always starts: stopping before
+            # it would make no progress, and a new session would face the same
+            # check. (In an old interactive session it is checked like the rest.)
+            first_in_fresh_session = i == 0 and elapsed() < fresh_session_minutes * 60
+            if not first_in_fresh_session and not fits(exp):
+                pending = [c["pipeline_name"] for c in to_run[i:]]
+                print("=============================================")
+                print(f"TIME LIMIT: elapsed {_fmt_min(elapsed())}, {name} expected "
+                      f"{_fmt_min(exp)}, start cutoff {_fmt_min(cutoff_seconds)}, "
+                      f"must end by {_fmt_min(budget_seconds)}.")
+                print(f"Stopping cleanly. Not run (next run resumes here): {pending}")
+                print("=============================================")
+                break
+
+            print(f">>> {name} | session up {_fmt_min(elapsed())} | "
+                  f"expected {_fmt_min(exp)}")
+            attempt = 1
+
+            while attempt <= max_attempts:
+                attempt_start = datetime.now()
+                try:
+                    res = run_batch_tracked_merge(**_merge_args(cfg, run_id))
+                    results[name] = res
+                    attempt_end = datetime.now()
+
+                    _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
+                        run_id, name, attempt, attempt_start, attempt_end,
+                        "SUCCESS", None,
+                        (attempt_end - attempt_start).total_seconds(),
+                        res.get("batch_id"),
+                    ])
+                    break
+
+                except Exception as e:
+                    attempt_end = datetime.now()
+                    _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
+                        run_id, name, attempt, attempt_start, attempt_end,
+                        "FAILED", str(e),
+                        (attempt_end - attempt_start).total_seconds(),
+                        None,
+                    ])
+
+                    # Release anything the failed attempt left cached.
+                    spark.catalog.clearCache()
+
+                    non_transient = isinstance(e, NON_TRANSIENT_ERRORS)
+                    retry_fits = fits(exp)
+                    can_retry = attempt < max_attempts and retry_fits and (
+                        retry_non_transient or not non_transient
+                    )
+
+                    if can_retry:
+                        print(f"Attempt {attempt} failed for {name}: {e}")
+                        print(f"Waiting {inter_attempt_wait_seconds} seconds before retry...")
+                        time.sleep(inter_attempt_wait_seconds)
+                        attempt += 1
+                    else:
+                        if non_transient and attempt < max_attempts:
+                            why = "non-transient error, not retrying"
+                        elif not retry_fits and attempt < max_attempts:
+                            why = "no time left in this session for a retry"
+                        else:
+                            why = "giving up on this pipeline"
+                        print(f"Attempt {attempt} failed for {name}: {e} -- {why}")
+                        failed_pipelines.append(name)
+                        break
+
+            # Free cached DataFrames before the next pipeline starts.
+            spark.catalog.clearCache()
+
+            if i < len(to_run) - 1 and inter_pipeline_wait_seconds:
+                print(f"Pausing {inter_pipeline_wait_seconds}s before next pipeline "
+                      f"(session stays active; capacity remains allocated)...")
+                time.sleep(inter_pipeline_wait_seconds)
+
+        run_end = datetime.now()
+        # A round that stops for time must have finished at least one pipeline
+        # that was not done before; otherwise the next round would be the same
+        # (e.g. the first pipeline keeps failing) and the Until loop would never
+        # end. Then it ends as a failure instead.
+        progressed = any(n not in redo for n in results)
+        no_progress = bool(pending) and bool(failed_pipelines) and not progressed
+        if pending and not no_progress:
+            status = "STOPPED_TIME_LIMIT"
+        elif not failed_pipelines:
+            status = "SUCCESS"
+        else:
+            status = "PARTIAL_FAILURE" if (results or skipped_done) else "FAILED"
+
+        _update_run_row(run_id, {
+            "RUN_END_DTTM": run_end,
+            "STATUS": status,
+            "SUCCEEDED_COUNT": len(results),
+            "FAILED_COUNT": len(failed_pipelines),
+            "FAILED_PIPELINE_NAMES": ",".join(failed_pipelines) if failed_pipelines else None,
+            "PENDING_PIPELINE_NAMES": ",".join(pending) if pending else None,
+        })
+
+        print("=============================================")
+        print(f"Run ID: {run_id} | Status: {status} | "
+              f"Completed this run: {len(results)} | Already done: {len(skipped_done)} | "
+              f"Total: {len(pipeline_configs)} | Session up: {_fmt_min(elapsed())}")
+        if failed_pipelines:
+            print("FAILED :", failed_pipelines)
+        if pending:
+            print("PENDING (next round continues here):", pending)
+            if failed_pipelines:
+                print("The FAILED pipelines above are retried first in the next round.")
+        print("=============================================")
+
+        outcome = {
+            "run_id": run_id,
+            "status": status,
+            "results": results,
+            "failed_pipelines": failed_pipelines,
+            "pending_pipelines": pending,
+            "skipped_done_pipelines": skipped_done,
+        }
+
+        if no_progress:
+            print("No pipeline finished in this round and the first one failed: "
+                  "stopping the loop instead of repeating the same round.")
+        if failed_pipelines and raise_on_failure and (not pending or no_progress):
+            # Run row is already closed above; this only surfaces the failure
+            # to the Fabric schedule / pipeline activity. Not raised while
+            # pipelines are pending: the next round retries the failed ones.
+            raise RuntimeError(
+                f"Orchestrator run {run_id} finished with status {status}. "
+                f"Failed pipelines: {failed_pipelines}"
+            )
+
+        return outcome
+
+    except BaseException as e:
+        # Only close the run row here if it is still RUNNING (i.e. the failure
+        # came from outside the normal completion path, or the cell was
+        # interrupted) -- otherwise keep the accurate status written above.
+        still_running = (
+            spark.table(RUN_TABLE)
+            .filter((col("RUN_ID") == run_id) & (col("STATUS") == "RUNNING"))
+            .count() > 0
+        )
+        if still_running:
+            _update_run_row(run_id, {
+                "RUN_END_DTTM": datetime.now(),
+                "STATUS": "FAILED",
+                "SUCCEEDED_COUNT": len(results),
+                "FAILED_COUNT": len(to_run) - len(results),
+                "FAILED_PIPELINE_NAMES": (
+                    ",".join(failed_pipelines) if failed_pipelines else str(e)[:1000]
+                ),
+            })
+        raise
+
+
+# ============================================================
+# Run it
+# ============================================================
+
+if __name__ == "__main__":
+    outcome = run_orchestrator(pipeline_configs)
+
+    # Hand the status to the Data pipeline (Until loop checks for
+    # 'STOPPED_TIME_LIMIT' and starts a fresh session to continue).
+    notebookutils.notebook.exit(outcome["status"])
