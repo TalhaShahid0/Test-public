@@ -6,3 +6,5 @@ FROM ALLERGY_DELTA.ALLERGY_ETL_RUN_LOG ORDER BY RUN_ID DESC;
 @concat('orch_', replace(guid(), '-', ''))
 
 @activity('Run Orchestrator').output.result.exitValue
+
+@equals(variables('loop_status'),'FAILED'
