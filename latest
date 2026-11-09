@@ -1,5 +1,27 @@
 # ============================================================
-# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v3
+# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v4
+#
+# v4 = v3 + speed options. With the defaults (max_parallel=1) it runs
+# exactly like v3: same order, same time box, same resume, same logs.
+#
+#   F. OPTIONAL PARALLEL (max_parallel=2..4). Pipelines that do not depend on
+#      each other run at the same time in this Spark session. A pipeline
+#      starts only after every earlier pipeline it is tied to has finished
+#      (reads its target, same target, or cfg["depends_on"] -- the same rule
+#      resume uses), so each one reads the same inputs as in a sequential run.
+#      The time box applies to every start (expected time x
+#      parallel_duration_factor, since pipelines running together are slower).
+#      Log / batch table writes are serialized (one at a time).
+#   G. HANG WATCHDOG (parallel mode). The earlier parallel try hung with 0
+#      active Spark stages. If pipelines are running but no Spark job has run
+#      for stall_minutes (20), the round prints a full thread dump (Python +
+#      JVM + JVM deadlock check), stops cleanly with STATUS
+#      'STOPPED_TIME_LIMIT' and RUN_NOTE 'PARALLEL_STALL: ...', and the next
+#      round of the Until loop continues SEQUENTIALLY (max_parallel=1) from
+#      where it stopped. Send the thread dump for the root cause.
+#   H. Run-row updates use a Delta UPDATE on RUN_ID (no MERGE join).
+#
+# ---- v3 notes ----
 #
 # Requires MERGE_NB (%run it first) -- it uses
 # run_batch_tracked_merge() and configure_spark_for_efficiency().
@@ -60,6 +82,11 @@
 #      first pipeline failed) raises instead, so the loop cannot repeat the
 #      same round forever.
 #
+#      A round in an OLD session (Fabric reused an earlier round's session)
+#      in which not even the first pipeline fits ends at once with
+#      STOPPED_TIME_LIMIT; the old session dies at its lifetime limit at the
+#      latest, and a later round gets a fresh session.
+#
 #   E. AUTO-CONTINUE. The last cell exits the notebook with the run STATUS
 #      (notebookutils.notebook.exit), so a Data pipeline "Until" loop around
 #      this notebook starts a fresh session while the exit value is
@@ -67,7 +94,10 @@
 # ============================================================
 
 import re
+import sys
 import time
+import threading
+import traceback
 from datetime import datetime, timedelta
 from delta.tables import DeltaTable
 from pyspark.sql.types import (
@@ -78,6 +108,18 @@ from pyspark.sql.functions import (
     coalesce, max as spark_max, col, lit, row_number, unix_timestamp,
 )
 from pyspark.sql.window import Window
+
+try:
+    from pyspark import InheritableThread as _WorkerThread   # pinned-thread safe
+except Exception:
+    _WorkerThread = threading.Thread
+
+# One lock for every write to the batch / log tables (MERGE_NB defines it;
+# fallback if this notebook runs without the v2 MERGE_NB).
+try:
+    _CONTROL_LOCK
+except NameError:
+    _CONTROL_LOCK = threading.RLock()
 
 try:
     from pyspark.errors import AnalysisException
@@ -110,6 +152,7 @@ ORCHESTRATION_RUN_SCHEMA = StructType([
     StructField("PENDING_PIPELINE_NAMES", StringType(), True),    # not run because of the time limit
     StructField("SKIPPED_DONE_PIPELINE_NAMES", StringType(), True),  # skipped by resume (already done)
     StructField("SESSION_START_DTTM", TimestampType(), True),     # NEW (v3): when this run's Spark session started
+    StructField("RUN_NOTE", StringType(), True),                  # NEW (v4): e.g. PARALLEL_STALL: <names>
 ])
 
 ORCHESTRATION_ATTEMPT_SCHEMA = StructType([
@@ -151,33 +194,30 @@ def _ensure_table(table, schema):
 
 
 def _append_row(table, schema, row_values):
-    spark.createDataFrame([row_values], schema=schema) \
-        .write.format("delta").mode("append") \
-        .option("mergeSchema", "true").saveAsTable(table)
+    with _CONTROL_LOCK:
+        spark.createDataFrame([row_values], schema=schema) \
+            .write.format("delta").mode("append") \
+            .option("mergeSchema", "true").saveAsTable(table)
 
 
-def _update_run_row(run_id, updates: dict):
-    """MERGE-based update of one RUN_TABLE row; schema built in the same
-    order as the dict keys so values never zip against wrong-typed fields."""
-    updates_with_id = dict(updates)
-    updates_with_id["RUN_ID"] = run_id
-    cols = list(updates_with_id.keys())
-
+def _update_run_row(run_id, updates: dict, lock_timeout=None):
+    """Update of one RUN_TABLE row (same effect as the old single-row MERGE):
+    a Delta UPDATE on RUN_ID, values cast to the schema types.
+    lock_timeout (seconds) is only used after a stall, so a stuck pipeline
+    thread holding the lock cannot block the run row from being closed."""
     field_lookup = {f.name: f for f in ORCHESTRATION_RUN_SCHEMA.fields}
-    row_schema = StructType([field_lookup[c] for c in cols])
-
-    row = spark.createDataFrame(
-        [[updates_with_id[c] for c in cols]],
-        schema=row_schema,
-    )
-    set_clause = {c: f"S.{c}" for c in cols if c != "RUN_ID"}
-    (
-        DeltaTable.forName(spark, RUN_TABLE)
-        .alias("T")
-        .merge(row.alias("S"), "T.RUN_ID = S.RUN_ID")
-        .whenMatchedUpdate(set=set_clause)
-        .execute()
-    )
+    set_clause = {
+        c: lit(v).cast(field_lookup[c].dataType) for c, v in updates.items()
+    }
+    got = _CONTROL_LOCK.acquire(timeout=-1 if lock_timeout is None else lock_timeout)
+    try:
+        DeltaTable.forName(spark, RUN_TABLE).update(
+            condition=col("RUN_ID") == lit(int(run_id)).cast("long"),
+            set=set_clause,
+        )
+    finally:
+        if got:
+            _CONTROL_LOCK.release()
 
 
 def _next_run_id():
@@ -197,7 +237,7 @@ def _recent_runs(limit=200):
         for r in (
             spark.table(RUN_TABLE)
             .select("RUN_ID", "RUN_START_DTTM", "RUN_END_DTTM", "STATUS",
-                    "SESSION_START_DTTM")
+                    "SESSION_START_DTTM", "RUN_NOTE")
             .orderBy(col("RUN_ID").desc())
             .limit(limit)
             .collect()
@@ -460,6 +500,248 @@ def _fmt_min(seconds):
     return "unknown" if seconds is None else f"{seconds / 60:.0f} min"
 
 
+def _dump_threads(max_frames=40):
+    """Print where every Python thread and every relevant JVM thread is, plus
+    the JVM's own deadlock check and driver heap use (for a parallel stall)."""
+    print("=================== THREAD DUMP (send this for diagnosis) ===================")
+    frames = sys._current_frames()
+    for th in threading.enumerate():
+        print(f"--- PYTHON {th.name} (daemon={th.daemon})")
+        f = frames.get(th.ident)
+        if f is not None:
+            print("".join(traceback.format_stack(f)[-max_frames:]))
+    try:
+        jvm = spark.sparkContext._jvm
+        mx = jvm.java.lang.management.ManagementFactory.getThreadMXBean()
+        dead = mx.findDeadlockedThreads()
+        print("JVM deadlocked threads:", "none" if dead is None else list(dead))
+        traces = jvm.java.lang.Thread.getAllStackTraces()
+        for t in traces.keySet().toArray():
+            state = str(t.getState())
+            lines = [str(x) for x in traces.get(t)][:max_frames]
+            txt = "\n    ".join(lines)
+            if state == "BLOCKED" or any(k in txt for k in ("spark", "delta", "py4j")):
+                print(f"--- JVM {t.getName()} [{state}]\n    {txt}")
+        rt = jvm.java.lang.Runtime.getRuntime()
+        print(f"Driver JVM heap: used {(rt.totalMemory() - rt.freeMemory()) / 2**30:.1f} GB "
+              f"of max {rt.maxMemory() / 2**30:.1f} GB")
+    except Exception as e:
+        print("JVM thread dump failed:", e)
+    print("=============================================================================")
+
+
+# ============================================================
+# Parallel round (max_parallel > 1) -- header F / G
+# ============================================================
+
+def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
+                        stop_flag, fits, elapsed, max_parallel, max_attempts,
+                        inter_attempt_wait_seconds, retry_non_transient,
+                        fresh_session_minutes, stall_minutes, heartbeat_minutes,
+                        cutoff_seconds, budget_seconds):
+    """Runs to_run with up to max_parallel pipelines at once. A pipeline starts
+    when every earlier pipeline it is tied to (_depends_on_earlier) has
+    finished, success or failure (as in the sequential loop, which also moves
+    on after a failure). Fills results / failed_pipelines like the sequential
+    loop and returns (pending, stalled):
+      pending = pipelines not run (time limit, or after a stall),
+      stalled = pipelines that were stuck when the watchdog fired."""
+    deps = _depends_on_earlier(to_run)
+    waiting = list(range(len(to_run)))
+    running = {}                  # idx -> start time
+    finished = set()
+    events = []                   # (idx, ok, res) posted by workers
+    sleeping = set()              # workers in their retry wait
+    state = threading.Lock()
+    last_event = [time.time()]
+    stop_new = False
+    first_start = True
+    stalled = []
+    sc = spark.sparkContext
+
+    def worker(idx):
+        cfg = to_run[idx]
+        name = cfg["pipeline_name"]
+        exp = expected[name]
+        ok, res = False, None
+        try:
+            try:
+                sc.setJobGroup(f"orch_{run_id}_{name}", name, interruptOnCancel=True)
+                sc.setLocalProperty("spark.scheduler.pool", name)
+            except Exception:
+                pass
+            attempt = 1
+            while attempt <= max_attempts:
+                attempt_start = datetime.now()
+                try:
+                    res = run_batch_tracked_merge(**_merge_args(cfg, run_id))
+                    attempt_end = datetime.now()
+                    _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
+                        run_id, name, attempt, attempt_start, attempt_end,
+                        "SUCCESS", None,
+                        (attempt_end - attempt_start).total_seconds(),
+                        res.get("batch_id"),
+                    ])
+                    ok = True
+                    break
+                except Exception as e:
+                    attempt_end = datetime.now()
+                    _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
+                        run_id, name, attempt, attempt_start, attempt_end,
+                        "FAILED", str(e),
+                        (attempt_end - attempt_start).total_seconds(),
+                        None,
+                    ])
+                    # No clearCache() here: it would wipe the other running
+                    # pipelines' data; run_batch_tracked_merge already
+                    # unpersisted its own.
+                    non_transient = isinstance(e, NON_TRANSIENT_ERRORS)
+                    retry_fits = fits(exp) and not stop_flag.is_set()
+                    can_retry = attempt < max_attempts and retry_fits and (
+                        retry_non_transient or not non_transient
+                    )
+                    if can_retry:
+                        print(f"Attempt {attempt} failed for {name}: {e}")
+                        print(f"Waiting {inter_attempt_wait_seconds} seconds before retry...")
+                        with state:
+                            sleeping.add(idx)
+                        time.sleep(inter_attempt_wait_seconds)
+                        with state:
+                            sleeping.discard(idx)
+                        attempt += 1
+                    else:
+                        if non_transient and attempt < max_attempts:
+                            why = "non-transient error, not retrying"
+                        elif not retry_fits and attempt < max_attempts:
+                            why = "no time left in this session for a retry"
+                        else:
+                            why = "giving up on this pipeline"
+                        print(f"Attempt {attempt} failed for {name}: {e} -- {why}")
+                        break
+        except BaseException as e:            # e.g. a log write failed
+            print(f"{name}: pipeline thread stopped: {e}")
+            ok = False
+        finally:
+            with state:
+                events.append((idx, ok, res if ok else None))
+                last_event[0] = time.time()
+
+    def names(idxs):
+        return [to_run[i]["pipeline_name"] for i in idxs]
+
+    last_job = time.time()
+    last_beat = time.time()
+    while waiting or running:
+        # ---- start what is ready (list order), within the time box --------
+        if not stop_new:
+            for idx in list(waiting):
+                if len(running) >= max_parallel:
+                    break
+                if not deps[idx] <= finished:
+                    continue
+                name = to_run[idx]["pipeline_name"]
+                exp = expected[name]
+                first_in_fresh_session = (
+                    first_start and elapsed() < fresh_session_minutes * 60
+                )
+                if not first_in_fresh_session and not fits(exp):
+                    stop_new = True
+                    print("=============================================")
+                    print(f"TIME LIMIT: elapsed {_fmt_min(elapsed())}, {name} expected "
+                          f"{_fmt_min(exp)}, start cutoff {_fmt_min(cutoff_seconds)}, "
+                          f"must end by {_fmt_min(budget_seconds)}.")
+                    print("No new pipeline starts; waiting for the running ones: "
+                          f"{names(running)}")
+                    print("=============================================")
+                    break
+                waiting.remove(idx)
+                first_start = False
+                running[idx] = time.time()
+                print(f">>> START {name} | session up {_fmt_min(elapsed())} | "
+                      f"expected {_fmt_min(exp)} | running: {names(running)}", flush=True)
+                _WorkerThread(target=worker, args=(idx,), daemon=True,
+                              name=f"pipeline-{name}").start()
+        if stop_new and not running:
+            break
+
+        time.sleep(2)
+
+        # ---- collect finished pipelines -----------------------------------
+        with state:
+            done = events[:]
+            events.clear()
+        for idx, ok, res in done:
+            t0 = running.pop(idx)
+            finished.add(idx)
+            name = to_run[idx]["pipeline_name"]
+            if ok:
+                results[name] = res
+            else:
+                failed_pipelines.append(name)
+            print(f"<<< END {name}: {'SUCCESS' if ok else 'FAILED'} "
+                  f"({_fmt_min(time.time() - t0)}) | session up {_fmt_min(elapsed())}",
+                  flush=True)
+
+        # ---- watchdog --------------------------------------------------------
+        now = time.time()
+        try:
+            active_jobs = list(sc.statusTracker().getActiveJobsIds())
+        except Exception:
+            active_jobs = [-1]                 # unknown -> treat as progress
+        if active_jobs:
+            last_job = now
+        with state:
+            busy = [i for i in running if i not in sleeping]
+            quiet_since = max(last_job, last_event[0])
+        if heartbeat_minutes and now - last_beat >= heartbeat_minutes * 60 and running:
+            last_beat = now
+            print(f"... {datetime.now():%H:%M:%S} running: "
+                  + ", ".join(f"{to_run[i]['pipeline_name']} ({_fmt_min(now - t)})"
+                              for i, t in running.items())
+                  + f" | active Spark jobs: {len(active_jobs)} | done {len(finished)}"
+                  f"/{len(to_run)} | waiting {len(waiting)}", flush=True)
+        if busy and stall_minutes and now - quiet_since > stall_minutes * 60:
+            stalled = names(running)
+            print("=============================================")
+            print(f"PARALLEL STALL: {stalled} running but no Spark job for "
+                  f"{_fmt_min(now - quiet_since)}. Stopping this round; the next "
+                  f"round continues SEQUENTIALLY from here.")
+            print("=============================================")
+            _dump_threads()
+            stop_flag.set()
+            try:
+                sc.cancelAllJobs()
+            except Exception:
+                pass
+            break
+
+    # Stuck pipelines are not failures: the next round runs them again.
+    pending = stalled + names(waiting)
+    return pending, stalled
+
+
+# ============================================================
+# Weekly maintenance (NOT called by run_orchestrator)
+# ============================================================
+
+def optimize_tables(pipeline_configs, include_logs=True):
+    """OPTIMIZE (compact small files) every target table, the batch table(s)
+    and the two log tables. Data is not changed; reads of the history (latest
+    version window, guards, max(BATCH_ID)) get faster because every run
+    appends small files. Run it in a separate notebook / schedule, e.g. once a
+    week -- not inside the time-boxed loop (it takes time itself)."""
+    tables = [c["target_table"] for c in pipeline_configs]
+    if include_logs:
+        tables += sorted({c["batch_table"] for c in pipeline_configs})
+        tables += [RUN_TABLE, ATTEMPT_TABLE]
+    for t in dict.fromkeys(tables):
+        if not spark.catalog.tableExists(t):
+            continue
+        t0 = time.time()
+        spark.sql(f"OPTIMIZE {t}")
+        print(f"OPTIMIZE {t}: {time.time() - t0:.0f}s")
+
+
 # ============================================================
 # Orchestrator entry point
 # ============================================================
@@ -484,6 +766,10 @@ def run_orchestrator(
     resume=True,
     resume_gap_minutes=60,
     resume_window_hours=24,
+    max_parallel=1,
+    stall_minutes=20,
+    parallel_duration_factor=1.3,
+    heartbeat_minutes=10,
 ):
     """
     Runs every config through run_batch_tracked_merge(), one at a time, with
@@ -504,6 +790,11 @@ def run_orchestrator(
     STALE-RUN GUARD: refuses to start if another RUN_TABLE row is still
     STATUS = 'RUNNING' (after the cleanup). Override with
     allow_run_with_stale_running_run=True.
+
+    max_parallel: 1 = sequential (v3 behaviour). 2..4 = independent pipelines
+    run together (header F), with the hang watchdog (header G, stall_minutes).
+    A round that follows a PARALLEL_STALL in the same resume chain runs
+    sequentially.
     """
     # Count from when the Spark session started (the lifetime clock), not from
     # this call: %run MERGE_NB / CONFIG_NB and earlier cells already used some.
@@ -595,6 +886,14 @@ def run_orchestrator(
                 rerun_idx.add(j)
                 if n in done_info:
                     redo.add(n)
+    if max_parallel > 1 and resumed_from:
+        notes = {r["RUN_ID"]: r.get("RUN_NOTE") for r in _recent_runs(limit=50)}
+        stalled_runs = [rid for rid in resumed_from
+                        if (notes.get(rid) or "").startswith("PARALLEL_STALL")]
+        if stalled_runs:
+            print(f"Run(s) {stalled_runs} of this chain stalled in parallel mode -> "
+                  f"this round runs SEQUENTIALLY (max_parallel=1).")
+            max_parallel = 1
     done_names = set(done_info) - redo
     to_run = [c for c in pipeline_configs if c["pipeline_name"] not in done_names]
     skipped_done = [c["pipeline_name"] for c in pipeline_configs
@@ -610,7 +909,7 @@ def run_orchestrator(
             history[c["pipeline_name"]] * duration_safety_factor
             if c["pipeline_name"] in history
             else unknown_duration_minutes * 60
-        )
+        ) * (parallel_duration_factor if max_parallel > 1 else 1.0)
         for c in to_run
     }
 
@@ -632,6 +931,7 @@ def run_orchestrator(
     if redo:
         print(f"Run again    : {sorted(redo)} (they depend on a pipeline that runs again)")
     print("To run       :", len(to_run))
+    print("Parallel     :", max_parallel if max_parallel > 1 else "no (sequential)")
     if budget_seconds is not None:
         for c in to_run:
             n = c["pipeline_name"]
@@ -645,91 +945,102 @@ def run_orchestrator(
         triggered_by, None,
         ",".join(skipped_done) if skipped_done else None,
         session_start,
+        None,
     ])
 
     results = {}
     failed_pipelines = []
     pending = []          # not run because of the time limit
+    stalled = []          # parallel mode: pipelines stuck when the watchdog fired
+    stop_flag = threading.Event()
 
     try:
-        for i, cfg in enumerate(to_run):
-            name = cfg["pipeline_name"]
-            exp = expected[name]
+        if max_parallel > 1:
+            pending, stalled = _run_parallel_round(
+                to_run, expected, run_id, results, failed_pipelines, stop_flag,
+                fits, elapsed, max_parallel, max_attempts, inter_attempt_wait_seconds,
+                retry_non_transient, fresh_session_minutes, stall_minutes,
+                heartbeat_minutes, cutoff_seconds, budget_seconds,
+            )
+        else:
+            for i, cfg in enumerate(to_run):
+                name = cfg["pipeline_name"]
+                exp = expected[name]
 
-            # The first pipeline of a FRESH session always starts: stopping before
-            # it would make no progress, and a new session would face the same
-            # check. (In an old interactive session it is checked like the rest.)
-            first_in_fresh_session = i == 0 and elapsed() < fresh_session_minutes * 60
-            if not first_in_fresh_session and not fits(exp):
-                pending = [c["pipeline_name"] for c in to_run[i:]]
-                print("=============================================")
-                print(f"TIME LIMIT: elapsed {_fmt_min(elapsed())}, {name} expected "
-                      f"{_fmt_min(exp)}, start cutoff {_fmt_min(cutoff_seconds)}, "
-                      f"must end by {_fmt_min(budget_seconds)}.")
-                print(f"Stopping cleanly. Not run (next run resumes here): {pending}")
-                print("=============================================")
-                break
-
-            print(f">>> {name} | session up {_fmt_min(elapsed())} | "
-                  f"expected {_fmt_min(exp)}")
-            attempt = 1
-
-            while attempt <= max_attempts:
-                attempt_start = datetime.now()
-                try:
-                    res = run_batch_tracked_merge(**_merge_args(cfg, run_id))
-                    results[name] = res
-                    attempt_end = datetime.now()
-
-                    _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
-                        run_id, name, attempt, attempt_start, attempt_end,
-                        "SUCCESS", None,
-                        (attempt_end - attempt_start).total_seconds(),
-                        res.get("batch_id"),
-                    ])
+                # The first pipeline of a FRESH session always starts: stopping before
+                # it would make no progress, and a new session would face the same
+                # check. (In an old interactive session it is checked like the rest.)
+                first_in_fresh_session = i == 0 and elapsed() < fresh_session_minutes * 60
+                if not first_in_fresh_session and not fits(exp):
+                    pending = [c["pipeline_name"] for c in to_run[i:]]
+                    print("=============================================")
+                    print(f"TIME LIMIT: elapsed {_fmt_min(elapsed())}, {name} expected "
+                          f"{_fmt_min(exp)}, start cutoff {_fmt_min(cutoff_seconds)}, "
+                          f"must end by {_fmt_min(budget_seconds)}.")
+                    print(f"Stopping cleanly. Not run (next run resumes here): {pending}")
+                    print("=============================================")
                     break
 
-                except Exception as e:
-                    attempt_end = datetime.now()
-                    _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
-                        run_id, name, attempt, attempt_start, attempt_end,
-                        "FAILED", str(e),
-                        (attempt_end - attempt_start).total_seconds(),
-                        None,
-                    ])
+                print(f">>> {name} | session up {_fmt_min(elapsed())} | "
+                      f"expected {_fmt_min(exp)}")
+                attempt = 1
 
-                    # Release anything the failed attempt left cached.
-                    spark.catalog.clearCache()
+                while attempt <= max_attempts:
+                    attempt_start = datetime.now()
+                    try:
+                        res = run_batch_tracked_merge(**_merge_args(cfg, run_id))
+                        results[name] = res
+                        attempt_end = datetime.now()
 
-                    non_transient = isinstance(e, NON_TRANSIENT_ERRORS)
-                    retry_fits = fits(exp)
-                    can_retry = attempt < max_attempts and retry_fits and (
-                        retry_non_transient or not non_transient
-                    )
-
-                    if can_retry:
-                        print(f"Attempt {attempt} failed for {name}: {e}")
-                        print(f"Waiting {inter_attempt_wait_seconds} seconds before retry...")
-                        time.sleep(inter_attempt_wait_seconds)
-                        attempt += 1
-                    else:
-                        if non_transient and attempt < max_attempts:
-                            why = "non-transient error, not retrying"
-                        elif not retry_fits and attempt < max_attempts:
-                            why = "no time left in this session for a retry"
-                        else:
-                            why = "giving up on this pipeline"
-                        print(f"Attempt {attempt} failed for {name}: {e} -- {why}")
-                        failed_pipelines.append(name)
+                        _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
+                            run_id, name, attempt, attempt_start, attempt_end,
+                            "SUCCESS", None,
+                            (attempt_end - attempt_start).total_seconds(),
+                            res.get("batch_id"),
+                        ])
                         break
 
-            # Free cached DataFrames before the next pipeline starts.
-            spark.catalog.clearCache()
+                    except Exception as e:
+                        attempt_end = datetime.now()
+                        _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
+                            run_id, name, attempt, attempt_start, attempt_end,
+                            "FAILED", str(e),
+                            (attempt_end - attempt_start).total_seconds(),
+                            None,
+                        ])
 
-            if i < len(to_run) - 1 and inter_pipeline_wait_seconds:
-                print(f"Pausing {inter_pipeline_wait_seconds}s before next pipeline "
-                      f"(session stays active; capacity remains allocated)...")
-                time.sleep(inter_pipeline_wait_seconds)
+                        # Release anything the failed attempt left cached.
+                        spark.catalog.clearCache()
+
+                        non_transient = isinstance(e, NON_TRANSIENT_ERRORS)
+                        retry_fits = fits(exp)
+                        can_retry = attempt < max_attempts and retry_fits and (
+                            retry_non_transient or not non_transient
+                        )
+
+                        if can_retry:
+                            print(f"Attempt {attempt} failed for {name}: {e}")
+                            print(f"Waiting {inter_attempt_wait_seconds} seconds before retry...")
+                            time.sleep(inter_attempt_wait_seconds)
+                            attempt += 1
+                        else:
+                            if non_transient and attempt < max_attempts:
+                                why = "non-transient error, not retrying"
+                            elif not retry_fits and attempt < max_attempts:
+                                why = "no time left in this session for a retry"
+                            else:
+                                why = "giving up on this pipeline"
+                            print(f"Attempt {attempt} failed for {name}: {e} -- {why}")
+                            failed_pipelines.append(name)
+                            break
+
+                # Free cached DataFrames before the next pipeline starts.
+                spark.catalog.clearCache()
+
+                if i < len(to_run) - 1 and inter_pipeline_wait_seconds:
+                    print(f"Pausing {inter_pipeline_wait_seconds}s before next pipeline "
+                          f"(session stays active; capacity remains allocated)...")
+                    time.sleep(inter_pipeline_wait_seconds)
 
         run_end = datetime.now()
         # A round that stops for time must have finished at least one pipeline
@@ -738,6 +1049,12 @@ def run_orchestrator(
         # end. Then it ends as a failure instead.
         progressed = any(n not in redo for n in results)
         no_progress = bool(pending) and bool(failed_pipelines) and not progressed
+        # Nothing could even start: this Spark session is already old (Fabric
+        # handed this round the previous round's session -- high concurrency).
+        # Ending quickly is right: that session dies at its lifetime limit at
+        # the latest, and the next round then gets a fresh one.
+        old_session = (bool(pending) and not results and not failed_pipelines
+                       and not stalled)
         if pending and not no_progress:
             status = "STOPPED_TIME_LIMIT"
         elif not failed_pipelines:
@@ -752,7 +1069,8 @@ def run_orchestrator(
             "FAILED_COUNT": len(failed_pipelines),
             "FAILED_PIPELINE_NAMES": ",".join(failed_pipelines) if failed_pipelines else None,
             "PENDING_PIPELINE_NAMES": ",".join(pending) if pending else None,
-        })
+            "RUN_NOTE": ("PARALLEL_STALL: " + ",".join(stalled))[:1000] if stalled else None,
+        }, lock_timeout=120 if stalled else None)
 
         print("=============================================")
         print(f"Run ID: {run_id} | Status: {status} | "
@@ -773,8 +1091,14 @@ def run_orchestrator(
             "failed_pipelines": failed_pipelines,
             "pending_pipelines": pending,
             "skipped_done_pipelines": skipped_done,
+            "stalled_pipelines": stalled,
         }
 
+        if old_session:
+            print(f"OLD SESSION: this Spark session started at {session_start} "
+                  f"({_fmt_min(elapsed())} ago), it was reused from an earlier round. "
+                  f"Nothing fits, so this round ends now; a later round gets a "
+                  f"new session.")
         if no_progress:
             print("No pipeline finished in this round and the first one failed: "
                   "stopping the loop instead of repeating the same round.")
@@ -790,6 +1114,13 @@ def run_orchestrator(
         return outcome
 
     except BaseException as e:
+        # Parallel mode: start no retries, cancel the running Spark jobs.
+        stop_flag.set()
+        if max_parallel > 1:
+            try:
+                spark.sparkContext.cancelAllJobs()
+            except Exception:
+                pass
         # Only close the run row here if it is still RUNNING (i.e. the failure
         # came from outside the normal completion path, or the cell was
         # interrupted) -- otherwise keep the accurate status written above.
@@ -807,7 +1138,7 @@ def run_orchestrator(
                 "FAILED_PIPELINE_NAMES": (
                     ",".join(failed_pipelines) if failed_pipelines else str(e)[:1000]
                 ),
-            })
+            }, lock_timeout=120 if max_parallel > 1 else None)
         raise
 
 
@@ -816,6 +1147,8 @@ def run_orchestrator(
 # ============================================================
 
 if __name__ == "__main__":
+    # Sequential (same as v3). For the parallel option use e.g.
+    #   outcome = run_orchestrator(pipeline_configs, max_parallel=2)
     outcome = run_orchestrator(pipeline_configs)
 
     # Hand the status to the Data pipeline (Until loop checks for
