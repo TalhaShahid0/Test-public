@@ -1,1 +1,1091 @@
+# ============================================================================
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v2: faster)
+# ============================================================================
+#
+# SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
+#   A. primary_keys = ""            -> row_hash over whole row (grain = row version)
+#   B. primary_keys = "COL_A, ..."  -> row_hash over PKs, non-key columns compared
+#                                      with <=> to detect updates (grain = entity)
+#   identity_column is excluded from row_hash but still written. Same I/U/D
+#   rules, same row_hash formula, same soft deletes, same batch table rows,
+#   same guards. Function names and arguments are unchanged.
+#
+# v2 CHANGES (speed only -- the rows written to the targets are the same):
+#
+#   1. row_hash is computed ONCE, while the source is staged, and the staged
+#      source is hash-partitioned on it. The target's latest-version DataFrame
+#      is hash-partitioned on ROW_HASH with the same partition count (one
+#      shuffle instead of two: the window and the repartition share it). The
+#      sync join then needs no shuffle at all on either side.
+#   2. ONE full outer join produces inserts, updates and soft deletes
+#      (was: two LEFT JOINs, source->target and target->source). Same
+#      conditions, same I/U/D tags.
+#   3. Mode A surrogate keys: computed straight from the staged copy (partition
+#      offsets + monotonically_increasing_id, the same formula as before), so
+#      the source is no longer copied two more times (was: 3 cached copies of
+#      the whole source per pipeline, now 1). Keys are still max+1..max+N over
+#      the source rows, exactly as before.
+#   4. Mode B surrogate keys: looked up only for the rows being written
+#      (new / changed / revived), after the diff, with the same PK lookup.
+#      Unchanged rows (most of them) no longer go through the key join.
+#   5. Mode B duplicate-key check groups on row_hash first (no shuffle, the
+#      staged copy is already partitioned on it); the exact PK GROUP BY runs
+#      only if that finds a candidate. Same result: equal PKs give equal hashes.
+#   6. Change set is persisted without an extra round-robin repartition.
+#   7. Stale-RUNNING guard and max(BATCH_ID) come from one query (was two).
+#   8. Batch row status update uses a Delta UPDATE on BATCH_ID (file skipping
+#      on BATCH_ID stats) instead of a MERGE that joins the whole batch table.
+#   9. _CONTROL_LOCK: batch-table writes and BATCH_ID allocation are one at a
+#      time, for the orchestrator's optional parallel mode (no effect when
+#      pipelines run one after another).
+#
+# ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
+# %%configure
+# {
+#   "driverCores": 4, "driverMemory": "28g",
+#   "executorCores": 4, "executorMemory": "28g",
+#   "numExecutors": 4,
+#   "conf": {
+#     "spark.dynamicAllocation.enabled": "true",
+#     "spark.dynamicAllocation.minExecutors": "1",
+#     "spark.dynamicAllocation.maxExecutors": "4",
+#     "spark.native.enabled": "true"
+#   }
+# }
+# Lower numExecutors / maxExecutors to lower consumption. Native execution
+# engine (Runtime 1.3) must be enabled at session start, not at runtime.
+#
+# IF YOU ARE SEEING ExitCode 137 (OOM-killed executor / container):
+#   137 means the container used more memory than it was allocated, not a
+#   code bug -- it happens to whichever executor is holding the largest task
+#   or cached partition at the time. Two independent levers:
+#     1. Fewer cores per executor for the SAME memory, i.e. more memory per
+#        core (a wide join/window on a skewed key needs headroom per task):
+#          "executorCores": 2, "executorMemory": "28g", "numExecutors": 6
+#     2. Spread the data over more partitions before it is cached -- pass a
+#        higher shuffle_partitions to
+#        configure_spark_for_efficiency(shuffle_partitions=400) if 137 keeps
+#        happening on one specific large target table.
+# ============================================================================
+
+import time
+import threading
+from functools import reduce
+
+from pyspark import StorageLevel
+from pyspark.sql.functions import (
+    col, lit, max as spark_max, coalesce, row_number, desc, broadcast,
+    spark_partition_id, monotonically_increasing_id, expr, when,
+    sum as spark_sum, count as spark_count,
+)
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType, TimestampType
+)
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+from datetime import datetime
+
+
+SYSTEM_COLS = {"is_deleted", "row_hash", "dw_updated_at", "batch_id",
+               "payload_hash", "entity_key"}
+
+_PERSIST = StorageLevel.MEMORY_AND_DISK   # spill to disk instead of evicting
+
+# Internal I/U/D tag added to the rows being appended. Deliberately an
+# unlikely name so it can never collide with a business column (a real column
+# called CHANGE_TYPE broke the first version). It is never written to the target.
+CHG_TAG = "__sync_chg__"
+
+# Internal columns of the staged source (never written to the target):
+RH_COL = "__sync_rh__"      # row_hash, computed once while staging
+PID_COL = "__sync_pid__"    # partition id of the staged row     (mode A keys)
+MID_COL = "__sync_mid__"    # monotonically_increasing_id of it  (mode A keys)
+_INTERNAL_COLS = {RH_COL, PID_COL, MID_COL}
+
+# Serializes writes to the shared batch / log tables (and the BATCH_ID
+# allocation) when the orchestrator runs pipelines in parallel threads.
+# Uncontended (free) in a sequential run.
+_CONTROL_LOCK = threading.RLock()
+
+
+# ============================================================================
+# Spark configuration for lower CPU / shuffle pressure
+# ============================================================================
+
+def configure_spark_for_efficiency(broadcast_mb=100, shuffle_partitions=200):
+    """
+    Runtime-settable tuning. Anything the runtime refuses is skipped quietly.
+    (Executor count / cores / memory / native engine must be set in %%configure
+    -- see the header. shuffle_partitions controls how finely a big shuffle is
+    split; too few partitions on skewed/large data is a common cause of a
+    single task outgrowing executor memory and getting OOM-killed (exit 137).)
+    """
+    settings = {
+        "spark.sql.adaptive.enabled": "true",
+        "spark.sql.adaptive.coalescePartitions.enabled": "true",
+        "spark.sql.adaptive.skewJoin.enabled": "true",
+        # Split a partition once it exceeds this size OR is this many times
+        # the median partition -- lower than the 256m/5x defaults so skew is
+        # caught before a task grows large enough to OOM.
+        "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "128m",
+        "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "3",
+        "spark.sql.adaptive.advisoryPartitionSizeInBytes": "128m",
+        "spark.sql.autoBroadcastJoinThreshold": str(broadcast_mb * 1024 * 1024),
+        "spark.microsoft.delta.optimizeWrite.enabled": "true",
+        "spark.sql.files.maxPartitionBytes": "134217728",
+        # More, smaller shuffle partitions -> each task holds less data in
+        # memory. AQE coalesces small ones back down, so this mainly helps
+        # the skewed/large end rather than adding overhead on the small end.
+        "spark.sql.shuffle.partitions": str(shuffle_partitions),
+        # Spill aggressively to disk instead of holding it all in memory.
+        "spark.sql.adaptive.forceOptimizeSkewedJoin": "true",
+        # Clarity has placeholder dates before 1582-10-15 / timestamps before
+        # 1900-01-01. CORRECTED writes/reads them exactly as-is (no value
+        # change); without it the Parquet write fails with WRITE_ANCIENT_DATETIME.
+        "spark.sql.parquet.datetimeRebaseModeInWrite": "CORRECTED",
+        "spark.sql.parquet.int96RebaseModeInWrite": "CORRECTED",
+        "spark.sql.parquet.datetimeRebaseModeInRead": "CORRECTED",
+        "spark.sql.parquet.int96RebaseModeInRead": "CORRECTED",
+    }
+    for k, v in settings.items():
+        try:
+            spark.conf.set(k, v)
+        except Exception as e:
+            print(f"   (skipped conf {k}: {str(e)[:80]})")
+
+
+def _num_partitions():
+    return int(spark.conf.get("spark.sql.shuffle.partitions", "200"))
+
+
+def _repartition_for_size(df, target_partitions=None):
+    """Round-robin repartition (kept for callers of the old helper)."""
+    return df.repartition(target_partitions or _num_partitions())
+
+
+def _split_cols(s):
+    return [c.strip() for c in s.split(",") if c.strip()] if s and s.strip() else []
+
+
+def _safe_name(prefix, table):
+    return prefix + "".join(ch if ch.isalnum() else "_" for ch in table)
+
+
+def _resolve_cols(df, names, context):
+    """Map config-supplied column names onto the DataFrame's actual casing."""
+    lookup = {c.lower(): c for c in df.columns}
+    resolved = []
+    for n in names:
+        key = n.strip().lower()
+        if key not in lookup:
+            raise ValueError(
+                f"{context}: column '{n}' is not present in the source query. "
+                f"Available: {sorted(df.columns)}"
+            )
+        resolved.append(lookup[key])
+    return resolved
+
+
+# ============================================================================
+# Sync spec: column lists, row_hash expression, attribute comparison
+# (exactly the expressions of the previous version)
+# ============================================================================
+
+def _sync_spec(targetTable, primaryKeys, nonKeyColumns, identityColumn):
+    pkList = [k.lower() for k in _split_cols(primaryKeys)]
+    nonPkList = [k.lower() for k in _split_cols(nonKeyColumns)]
+
+    pkList = [c for c in pkList if c not in SYSTEM_COLS]
+    nonPkList = [c for c in nonPkList if c not in SYSTEM_COLS]
+
+    allColsList = list(dict.fromkeys(pkList + nonPkList))
+
+    if not allColsList:
+        raise ValueError(
+            f"deltaUpsertAndSync: no columns to load for {targetTable}. "
+            f"Pass primaryKeys and/or nonKeyColumns."
+        )
+
+    if CHG_TAG.lower() in allColsList:
+        raise ValueError(
+            f"deltaUpsertAndSync: {targetTable} has a column named '{CHG_TAG}', "
+            f"which is reserved for internal change tracking. Rename it."
+        )
+
+    identityLower = identityColumn.strip().lower() if identityColumn else None
+
+    if pkList:
+        if identityLower in pkList:
+            raise ValueError(
+                f"deltaUpsertAndSync: identity column '{identityColumn}' must not "
+                f"be part of primaryKeys for {targetTable}."
+            )
+
+        pkConcat = ", ".join([f"coalesce(cast({c} as string), '')" for c in pkList])
+        rowHashExpr = f"sha2(concat_ws('||', {pkConcat}), 256)"
+
+        # <=> not <>: a single NULL must not silently disable update detection.
+        nonPkCompares = [
+            f"src.{c} <=> tgt.{c}" for c in nonPkList if c != identityLower
+        ]
+        attrChangeCheck = (
+            f"OR NOT ({' AND '.join(nonPkCompares)})" if nonPkCompares else ""
+        )
+    else:
+        hashCols = [c for c in allColsList if c != identityLower]
+        if not hashCols:
+            raise ValueError(
+                f"deltaUpsertAndSync: {targetTable} has no business columns left "
+                f"after excluding the identity column from the hash."
+            )
+        allConcat = ", ".join([f"coalesce(cast({c} as string), '')" for c in hashCols])
+        rowHashExpr = f"sha2(concat_ws('||', {allConcat}), 256)"
+        attrChangeCheck = ""
+
+    return {
+        "pkList": pkList,
+        "nonPkList": nonPkList,
+        "allColsList": allColsList,
+        "identityLower": identityLower,
+        "rowHashExpr": rowHashExpr,
+        "attrChangeCheck": attrChangeCheck,
+        "insertColsList": allColsList + ["row_hash", "is_deleted", "dw_updated_at", "batch_id"],
+    }
+
+
+# ============================================================================
+# Shared helpers: source staging, latest-version, parallel sequential keys
+# ============================================================================
+
+def _stage_source(source_query, target_table, row_hash_expr=None,
+                  with_row_ids=False, view_prefix="_src_"):
+    """
+    Evaluate the (expensive) source query once and keep it (MEMORY_AND_DISK).
+    With row_hash_expr the hash is computed here, once, into RH_COL and the
+    data is hash-partitioned on it, so the later sync join with the target
+    (partitioned the same way) needs no shuffle. sha2 values are uniform, so
+    this also spreads a skewed source evenly (the reason the old version
+    repartitioned before caching -- exit code 137).
+    with_row_ids adds PID_COL / MID_COL (frozen in the cache) for mode A keys.
+    """
+    df = spark.sql(source_query)
+    n = _num_partitions()
+    if row_hash_expr is None:
+        df = df.repartition(n)
+    else:
+        df = df.withColumn(RH_COL, expr(row_hash_expr)).repartition(n, col(RH_COL))
+    if with_row_ids:
+        df = (
+            df.withColumn(PID_COL, spark_partition_id())
+              .withColumn(MID_COL, monotonically_increasing_id())
+        )
+    df = df.persist(_PERSIST)
+    view = _safe_name(view_prefix, target_table)
+    df.createOrReplaceTempView(view)
+    return f"SELECT * FROM {view}", view, df
+
+
+def _latest_target_df(target_table):
+    """
+    Latest version per ROW_HASH (including soft-deleted). Persisted; the caller
+    unpersists. Hash-partitioned on ROW_HASH: the window uses that partitioning
+    (one shuffle) and the sync join reuses it (no shuffle).
+    """
+    df = spark.table(target_table).repartition(_num_partitions(), col("ROW_HASH"))
+    w = Window.partitionBy("ROW_HASH").orderBy(desc("DW_UPDATED_AT"), desc("BATCH_ID"))
+    latest = (
+        df.withColumn("_rn", row_number().over(w))
+          .filter(col("_rn") == 1)
+          .drop("_rn")
+    )
+    return latest.persist(_PERSIST)
+
+
+def _add_sequential_key(df, name, start):
+    """
+    Adds `name` = start+1 .. start+N, in parallel (no single-partition window).
+    Per-partition counts give each partition an offset; monotonically_increasing_id
+    gives the index inside the partition. Returns (keyed_df, persisted_base).
+    """
+    base = (
+        df.withColumn("_pid", spark_partition_id())
+          .withColumn("_mid", monotonically_increasing_id())
+          .persist(_PERSIST)
+    )
+    base.count()  # freeze partitioning / ids before deriving offsets
+
+    offsets = (
+        base.groupBy("_pid").agg(spark_count(lit(1)).alias("_cnt"))
+            .withColumn(
+                "_off",
+                spark_sum("_cnt").over(Window.orderBy("_pid")) - col("_cnt"),
+            )
+            .select("_pid", "_off")
+    )
+
+    keyed = (
+        base.join(broadcast(offsets), "_pid")
+            .withColumn(
+                name,
+                lit(int(start)) + col("_off")
+                + (col("_mid") - col("_pid").cast("long") * lit(1 << 33))
+                + lit(1),
+            )
+            .drop("_pid", "_mid", "_off")
+    )
+    return keyed, base
+
+
+def _mode_a_keyed(staged_df, identity_column, max_key):
+    """
+    Mode A keys straight from the staged copy (it carries PID_COL / MID_COL,
+    frozen when it was cached): key = max_key + offset(partition) + index in
+    partition + 1 -- the same formula as _add_sequential_key, so every source
+    row gets max+1..max+N as before, without copying the source again.
+    Returns (keyed_df, source_count). keyed_df is a projection of the cache.
+    """
+    counts = {
+        r[PID_COL]: r["count"]
+        for r in staged_df.groupBy(PID_COL).count().collect()
+    }
+    source_count = sum(counts.values())
+    n_parts = (max(counts) + 1) if counts else 1
+    offsets, run = [], 0
+    for p in range(n_parts):
+        offsets.append(run)
+        run += counts.get(p, 0)
+    offs = "array(" + ", ".join(f"{o}L" for o in offsets) + ")"
+    key_expr = (
+        f"CAST({int(max_key)} AS BIGINT) "
+        f"+ element_at({offs}, {PID_COL} + 1) "
+        f"+ ({MID_COL} - CAST({PID_COL} AS BIGINT) * {1 << 33}L) + 1L"
+    )
+    return staged_df.withColumn(identity_column, expr(key_expr)), source_count
+
+
+def _active_target_count(target_table):
+    """
+    Exact active count (latest version per row_hash, not soft-deleted).
+    Only used when exact_target_count=True; the normal path derives it from
+    the change counts without rescanning history.
+    """
+    if not spark.catalog.tableExists(target_table):
+        return 0
+
+    df = spark.table(target_table)
+    if "ROW_HASH" not in df.columns or "DW_UPDATED_AT" not in df.columns:
+        return df.count()
+
+    return (
+        df.withColumn(
+            "_rn",
+            row_number().over(
+                Window.partitionBy("ROW_HASH")
+                      .orderBy(desc("DW_UPDATED_AT"), desc("BATCH_ID"))
+            ),
+        )
+        .filter((col("_rn") == 1) & (coalesce(col("IS_DELETED"), lit(0)) == 0))
+        .count()
+    )
+
+
+# ============================================================================
+# Mode B keys for the rows being written (after the diff)
+# ============================================================================
+
+def _fill_lookup_keys(changes_df, latest_df, spec, key_lookup, cached):
+    """
+    Upsert rows (I / U) get their identity exactly as before: the key of the
+    same PK in the target's latest versions (incl. soft-deleted, NULL keys
+    ignored), else a new sequential key after max_key. Soft-delete rows (D)
+    already carry the target's key. Only the upsert rows are looked up; the
+    lookup set is restricted to their PKs first (same matches).
+    """
+    ident = spec["identityLower"]
+    pks = spec["pkList"]
+
+    ups = changes_df.filter(col(CHG_TAG) != "D").drop(ident)
+    dels = changes_df.filter(col(CHG_TAG) == "D")
+
+    if key_lookup["target_has_key"]:
+        keys = (
+            latest_df
+            .select(*pks, ident)
+            .filter(col(ident).isNotNull())
+            .join(ups.select(*pks).distinct(), pks, "left_semi")
+            .distinct()
+        )
+        joined = ups.join(keys, pks, "left")
+        existing = joined.filter(col(ident).isNotNull())
+        new_raw = joined.filter(col(ident).isNull()).drop(ident)
+    else:
+        existing = None
+        new_raw = ups
+
+    new_rows, base = _add_sequential_key(new_raw, ident, key_lookup["max_key"])
+    cached.append(base)
+
+    out = dels
+    if existing is not None:
+        out = out.unionByName(existing)
+    return out.unionByName(new_rows)
+
+
+# ============================================================================
+# deltaUpsertAndSync
+# ============================================================================
+
+def deltaUpsertAndSync(
+    targetTable,
+    sourceQuery=None,
+    primaryKeys="",
+    nonKeyColumns="",
+    identityColumn=None,
+    batchId=None,
+    latestDf=None,
+    stagedDf=None,
+    keyLookup=None,
+):
+    """
+    Appends new records, updates and soft deletes to a Delta table. Never
+    removes rows.
+
+    primaryKeys empty  -> row_hash over all business columns (mode A).
+    primaryKeys given  -> row_hash over the PKs only, non-key columns compared
+                          to detect updates (mode B).
+
+    latestDf, if given, is the already-persisted latest-version-per-hash of the
+    target (owned and unpersisted by the caller). Otherwise it is built here.
+
+    stagedDf (from run_batch_tracked_merge): the staged source, already carrying
+    RH_COL. Otherwise sourceQuery is staged here (old standalone behaviour: an
+    identity column, if listed in nonKeyColumns, is taken from the source).
+
+    keyLookup (mode B, from run_batch_tracked_merge): {"max_key", "target_has_key"}
+    -- upsert rows get their identity after the diff (_fill_lookup_keys).
+
+    Returns dict: inserted, updated, deleted, before_active, after_active.
+    """
+    spec = _sync_spec(targetTable, primaryKeys, nonKeyColumns, identityColumn)
+    allColsList = spec["allColsList"]
+    identityLower = spec["identityLower"]
+    attrChangeCheck = spec["attrChangeCheck"]
+    insertCols = ", ".join(spec["insertColsList"])
+
+    batchIdLiteral = "CAST(NULL AS BIGINT)" if batchId is None else str(batchId)
+
+    cached = []
+    views = []
+
+    owns_staged = stagedDf is None
+    if owns_staged:
+        _, sview, stagedDf = _stage_source(
+            sourceQuery, targetTable, spec["rowHashExpr"], view_prefix="_srcs_"
+        )
+        cached.append(stagedDf)
+        views.append(sview)
+
+    owns_latest = latestDf is None
+    latest_df = _latest_target_df(targetTable) if owns_latest else latestDf
+    if owns_latest:
+        cached.append(latest_df)
+
+    src_view = _safe_name("_syncsrc_", targetTable)
+    latest_view = _safe_name("_latest_", targetTable)
+    changes_view = _safe_name("_chg_", targetTable)
+    stagedDf.createOrReplaceTempView(src_view)
+    latest_df.createOrReplaceTempView(latest_view)
+    views += [src_view, latest_view, changes_view]
+
+    try:
+        before_active = latest_df.filter(
+            coalesce(col("is_deleted"), lit(0)) == 0
+        ).count()
+
+        # Upsert rows take the source values, soft-delete rows the target's.
+        selCols = []
+        for c in allColsList:
+            if keyLookup is not None and c == identityLower:
+                selCols.append(
+                    f"CASE WHEN src.{RH_COL} IS NOT NULL THEN CAST(NULL AS BIGINT) "
+                    f"ELSE tgt.{c} END AS {c}"
+                )
+            else:
+                selCols.append(
+                    f"CASE WHEN src.{RH_COL} IS NOT NULL THEN src.{c} "
+                    f"ELSE tgt.{c} END AS {c}"
+                )
+
+        # change_type: I = insert/revival, U = update of active entity, D = soft delete
+        #   upsert (src row) : tgt.row_hash IS NULL OR tgt.is_deleted = 1 [OR attr change]
+        #   soft delete      : no src row AND tgt.is_deleted = 0
+        selectSql = f"""
+    SELECT
+        {', '.join(selCols)},
+        CASE WHEN src.{RH_COL} IS NOT NULL THEN src.{RH_COL} ELSE tgt.row_hash END AS row_hash,
+        CASE WHEN src.{RH_COL} IS NOT NULL THEN 0 ELSE 1 END AS is_deleted,
+        current_timestamp() AS dw_updated_at,
+        {batchIdLiteral} AS batch_id,
+        CASE WHEN src.{RH_COL} IS NULL THEN 'D'
+             WHEN tgt.row_hash IS NOT NULL AND coalesce(tgt.is_deleted, 0) = 0 THEN 'U'
+             ELSE 'I' END AS {CHG_TAG}
+    FROM {src_view} src
+    FULL OUTER JOIN {latest_view} tgt
+        ON src.{RH_COL} = tgt.row_hash
+    WHERE (src.{RH_COL} IS NOT NULL
+           AND (tgt.row_hash IS NULL
+                OR tgt.is_deleted = 1
+                {attrChangeCheck}))
+       OR (src.{RH_COL} IS NULL AND tgt.is_deleted = 0)
+    """
+
+        mode = "natural-key" if spec["pkList"] else "full-row-hash"
+        print(f"Running sync for target table: {targetTable} [{mode} mode]...")
+
+        # Evaluate the diff once, keep it, count it, then append it.
+        changes_df = spark.sql(selectSql).persist(_PERSIST)
+        cached.append(changes_df)
+        counts = {
+            r[CHG_TAG]: r["count"]
+            for r in changes_df.groupBy(CHG_TAG).count().collect()
+        }
+        inserted = counts.get("I", 0)
+        updated = counts.get("U", 0)
+        deleted = counts.get("D", 0)
+
+        if inserted + updated + deleted > 0:
+            final_df = changes_df
+            if keyLookup is not None and identityLower:
+                final_df = _fill_lookup_keys(changes_df, latest_df, spec, keyLookup, cached)
+            final_df.createOrReplaceTempView(changes_view)
+            # Explicit column list: same by-name behaviour as the original INSERT.
+            spark.sql(
+                f"INSERT INTO {targetTable} ({insertCols}) "
+                f"SELECT {insertCols} FROM {changes_view}"
+            )
+        else:
+            print("   No changes detected; nothing appended.")
+
+        # Updates replace an active row, so they net to zero.
+        after_active = before_active + inserted - deleted
+
+        print("   --> Success!")
+        print("-" * 75)
+
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "deleted": deleted,
+            "before_active": before_active,
+            "after_active": after_active,
+        }
+    finally:
+        for v in views:
+            try:
+                spark.catalog.dropTempView(v)
+            except Exception:
+                pass
+        for d in cached:
+            try:
+                d.unpersist()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Generic Batch Control Table Schema
+# ============================================================================
+
+BATCH_SCHEMA = StructType([
+    StructField("BATCH_ID", LongType(), True),
+    StructField("PIPELINE_NAME", StringType(), False),
+    StructField("TARGET_TABLE", StringType(), False),
+    StructField("LOAD_TYPE", StringType(), True),
+    StructField("BATCH_START_DTTM", TimestampType(), True),
+    StructField("BATCH_END_DTTM", TimestampType(), True),
+    StructField("STATUS", StringType(), True),
+    StructField("SOURCE_RECORD_COUNT", LongType(), True),
+    StructField("INSERTED_RECORD_COUNT", LongType(), True),
+    StructField("UPDATED_RECORD_COUNT", LongType(), True),
+    StructField("DELETED_RECORD_COUNT", LongType(), True),
+    StructField("TOTAL_TARGET_COUNT", LongType(), True),
+    StructField("ERROR_MESSAGE", StringType(), True),
+    StructField("CREATED_BY", StringType(), True),
+])
+
+
+def _ensure_batch_table(batch_table):
+    if not spark.catalog.tableExists(batch_table):
+        print("Batch table does not exist. Creating:", batch_table)
+        spark.createDataFrame([], BATCH_SCHEMA) \
+            .write.format("delta").mode("overwrite").saveAsTable(batch_table)
+        print("Batch table created successfully.")
+        return
+
+    existing_cols = {f.name for f in spark.table(batch_table).schema.fields}
+    missing_fields = [f for f in BATCH_SCHEMA.fields if f.name not in existing_cols]
+
+    if missing_fields:
+        add_cols_ddl = ", ".join(
+            f"{f.name} {f.dataType.simpleString()}" for f in missing_fields
+        )
+        print(f"Batch table is missing columns [{add_cols_ddl}]. Altering:", batch_table)
+        spark.sql(f"ALTER TABLE {batch_table} ADD COLUMNS ({add_cols_ddl})")
+
+
+def _write_batch_row(batch_table, row_values):
+    df = spark.createDataFrame([row_values], schema=BATCH_SCHEMA)
+    df.write.format("delta").mode("append") \
+        .option("mergeSchema", "true").saveAsTable(batch_table)
+
+
+def _update_batch_row(batch_table, batch_id, updates: dict):
+    """Set these columns on the row(s) with this BATCH_ID (same effect as the
+    old single-row MERGE). A Delta UPDATE with a literal condition skips every
+    file whose BATCH_ID min/max cannot match, instead of joining the whole
+    batch table. Values are cast to the BATCH_SCHEMA types."""
+    field_lookup = {f.name: f for f in BATCH_SCHEMA.fields}
+    set_clause = {
+        c: lit(v).cast(field_lookup[c].dataType) for c, v in updates.items()
+    }
+    with _CONTROL_LOCK:
+        DeltaTable.forName(spark, batch_table).update(
+            condition=col("BATCH_ID") == lit(int(batch_id)).cast("long"),
+            set=set_clause,
+        )
+
+
+# ============================================================================
+# Generic Target Table Creation
+# ============================================================================
+
+def _create_target_table_if_missing(target_table, source_query=None, schema_df=None):
+    """
+    Infers business columns from the schema of schema_df (or source_query).
+    Must include the identity column, if any.
+
+    NOTE: skipped if target_table already exists with a different schema (legacy
+    naming, or one predating IS_DELETED / BATCH_ID) -- reconcile by hand first.
+    """
+    if spark.catalog.tableExists(target_table):
+        print(f"Target table already exists: {target_table}")
+        return
+
+    print(f"Target table does not exist. Creating: {target_table}")
+
+    sample_df = schema_df if schema_df is not None else spark.sql(source_query)
+    business_cols_ddl = ",\n        ".join(
+        f"{f.name} {f.dataType.simpleString()}" for f in sample_df.schema.fields
+    )
+
+    create_sql = f"""
+    CREATE TABLE {target_table} (
+        {business_cols_ddl},
+        ROW_HASH STRING,
+        IS_DELETED INT,
+        DW_UPDATED_AT TIMESTAMP,
+        BATCH_ID BIGINT
+    )
+    USING DELTA
+    """
+    spark.sql(create_sql)
+    print(f"Target table created successfully: {target_table}")
+
+
+# ============================================================================
+# Primary key validation (runs against the cached source)
+# ============================================================================
+
+def _validate_primary_keys(source_query, pk_cols, target_table, staged_df=None):
+    """
+    NULL keys collide with '' in the hash; duplicate keys share a row_hash and
+    are appended every run. Both break mode B silently, so fail loudly.
+    Source is already persisted, so these passes are cheap. With staged_df
+    (carrying the PK row_hash, partitioned on it) duplicates are first looked
+    for by row_hash without a shuffle; equal PKs always give equal hashes, so
+    the exact PK GROUP BY is needed only when that finds a candidate.
+    """
+    src = staged_df if staged_df is not None else spark.sql(source_query)
+    resolved = _resolve_cols(src, pk_cols, f"primary_keys for {target_table}")
+
+    null_cond = reduce(lambda a, b: a | b, [col(c).isNull() for c in resolved])
+    if src.filter(null_cond).limit(1).count() > 0:
+        raise ValueError(
+            f"{target_table}: primary_keys {resolved} contain NULLs in the source. "
+            f"A NULL key cannot identify a row -- fix the source query or choose "
+            f"a different key."
+        )
+
+    maybe_dup = True
+    if staged_df is not None and RH_COL in staged_df.columns:
+        maybe_dup = (
+            src.groupBy(RH_COL).count().filter(col("count") > 1).limit(1).count() > 0
+        )
+    if maybe_dup:
+        dup = (
+            src.groupBy(*resolved).count().filter(col("count") > 1).limit(1).count()
+        )
+        if dup > 0:
+            raise ValueError(
+                f"{target_table}: primary_keys {resolved} are not unique in the source. "
+                f"Run a GROUP BY ... HAVING COUNT(*) > 1 on the source query to see the "
+                f"duplicates."
+            )
+
+    return resolved
+
+
+# ============================================================================
+# Generic Batch-Tracked Pipeline Runner
+# ============================================================================
+
+def run_batch_tracked_merge(
+    pipeline_name,
+    target_table,
+    batch_table,
+    source_query,
+    primary_keys,
+    non_key_columns,
+    identity_column=None,
+    load_type="FULL",
+    created_by="Fabric Notebook",
+    allow_run_with_stale_running_batch=False,
+    validate_primary_keys=True,
+    exact_target_count=False,
+):
+    """
+    Generic batch-tracked wrapper around deltaUpsertAndSync(). Call once per
+    table. Works in both modes -- see the header.
+
+    WARNING: deltaUpsertAndSync() soft-deletes, on every run, any entity absent
+    from source_query. Only point this at a target whose source_query is the
+    full, authoritative population every time it runs.
+
+    identity_column, if given, is generated here (mode A: max+1..max+N over the
+    source rows; mode B: the PK's existing key, else a new one).
+    Do NOT include it in primary_keys or non_key_columns -- it is appended
+    automatically and excluded from row_hash.
+
+    exact_target_count=True recomputes TOTAL_TARGET_COUNT with a full window over
+    history (old behaviour, expensive). Default derives it from the change counts,
+    which is identical unless the SOURCE contains duplicate rows in mode A.
+    """
+    if load_type != "FULL":
+        raise ValueError(
+            f"{pipeline_name}: deltaUpsertAndSync soft-deletes rows absent from "
+            f"source_query on every run, so only load_type='FULL' is supported. "
+            f"Got '{load_type}'."
+        )
+
+    pk_cols = _split_cols(primary_keys)
+
+    if identity_column:
+        declared = {
+            c.lower() for c in _split_cols(primary_keys + "," + non_key_columns)
+        }
+        if identity_column.strip().lower() in declared:
+            raise ValueError(
+                f"{pipeline_name}: identity_column '{identity_column}' must not "
+                f"appear in primary_keys or non_key_columns; it is appended "
+                f"automatically."
+            )
+
+    _ensure_batch_table(batch_table)
+
+    batch_id = None
+    temp_views = []
+    cached_dfs = []
+    lock_held = False
+
+    try:
+        # ---- Step 0+1: stale / concurrent-run guard and batch id, one query --
+        # (guard, new BATCH_ID and its RUNNING row are one step under the lock,
+        # so two parallel pipelines can never get the same BATCH_ID)
+        _CONTROL_LOCK.acquire()
+        lock_held = True
+        guard = (
+            spark.table(batch_table)
+            .agg(
+                spark_sum(
+                    when((col("PIPELINE_NAME") == pipeline_name)
+                         & (col("STATUS") == "RUNNING"), 1).otherwise(0)
+                ).alias("RUNNING_COUNT"),
+                coalesce(spark_max(col("BATCH_ID")), lit(0)).alias("MAX_BATCH_ID"),
+            )
+            .collect()[0]
+        )
+        stale_running = guard["RUNNING_COUNT"] or 0
+        if stale_running > 0 and not allow_run_with_stale_running_batch:
+            raise RuntimeError(
+                f"Found {stale_running} batch(es) already RUNNING for pipeline "
+                f"'{pipeline_name}'. Refusing to start a new run. Investigate "
+                f"{batch_table}, or pass allow_run_with_stale_running_batch=True."
+            )
+
+        batch_id = guard["MAX_BATCH_ID"] + 1
+        batch_start = datetime.now()
+
+        mode = "natural-key" if pk_cols else "full-row-hash"
+
+        print("=" * 60)
+        print("STARTING PIPELINE:", pipeline_name)
+        print("Batch ID     :", batch_id)
+        print("Target Table :", target_table)
+        print("Match Mode   :", mode)
+        print("Batch Start  :", batch_start)
+        print("=" * 60)
+
+        # ---- Step 2: RUNNING batch row --------------------------------------
+        _write_batch_row(batch_table, [
+            batch_id, pipeline_name, target_table, load_type,
+            batch_start, None, "RUNNING",
+            None, None, None, None, None, None,
+            created_by,
+        ])
+        _CONTROL_LOCK.release()
+        lock_held = False
+
+        effective_non_key_columns = (
+            f"{non_key_columns}, {identity_column}" if identity_column
+            else non_key_columns
+        )
+        spec = _sync_spec(target_table, primary_keys, effective_non_key_columns,
+                          identity_column)
+
+        # ---- Step 3a: stage the source ONCE (row_hash computed here) --------
+        mode_a_keys = bool(identity_column) and not pk_cols
+        staged_query, src_view, src_df = _stage_source(
+            source_query, target_table, spec["rowHashExpr"], with_row_ids=mode_a_keys
+        )
+        temp_views.append(src_view)
+        cached_dfs.append(src_df)
+        business_cols = [c for c in src_df.columns if c not in _INTERNAL_COLS]
+
+        # ---- Step 3b: validate key, surrogate keys, create target -----------
+        if pk_cols and validate_primary_keys:
+            _validate_primary_keys(staged_query, pk_cols, target_table, staged_df=src_df)
+
+        sync_df = src_df
+        key_lookup = None
+        source_count = None
+        schema_df = src_df.select(*business_cols)
+
+        if identity_column:
+            if identity_column in business_cols:
+                raise ValueError(
+                    f"_assign_surrogate_keys: '{identity_column}' is already a column in "
+                    f"source_query for {target_table}. The identity column is generated "
+                    f"here and must not be selected by the source query."
+                )
+
+            target_has_key = (
+                spark.catalog.tableExists(target_table)
+                and identity_column in [f.name for f in spark.table(target_table).schema.fields]
+            )
+
+            max_key = 0
+            if target_has_key:
+                max_key = (
+                    spark.table(target_table)
+                    .agg(coalesce(spark_max(col(identity_column)), lit(0)).alias("m"))
+                    .collect()[0]["m"]
+                )
+
+            if not pk_cols:
+                # ---- Mode A: every source row gets max+1..max+N -------------
+                sync_df, source_count = _mode_a_keyed(src_df, identity_column, max_key)
+                schema_df = src_df.select(
+                    *business_cols, lit(None).cast("bigint").alias(identity_column)
+                )
+            else:
+                # ---- Mode B: lookup by PK, then increment (after the diff) --
+                resolved_pks = _resolve_cols(
+                    src_df, pk_cols, f"primary_keys for {target_table}"
+                )
+                key_lookup = {"max_key": max_key, "target_has_key": target_has_key}
+                schema_df = src_df.select(
+                    *resolved_pks,
+                    *[c for c in business_cols if c not in resolved_pks],
+                    lit(None).cast("bigint").alias(identity_column),
+                )
+
+        # Declared columns must cover the source query (a column-list INSERT
+        # silently NULL-fills anything omitted).
+        source_cols = {c.lower() for c in schema_df.columns}
+        declared_cols = {
+            c.lower()
+            for c in _split_cols(primary_keys + "," + effective_non_key_columns)
+        }
+        undeclared = source_cols - declared_cols - SYSTEM_COLS
+        if undeclared:
+            raise ValueError(
+                f"{pipeline_name}: columns present in source_query but not declared "
+                f"in primary_keys / non_key_columns would be NULL-filled on insert: "
+                f"{sorted(undeclared)}"
+            )
+
+        _create_target_table_if_missing(target_table, schema_df=schema_df)
+
+        # ---- Step 4: source count (cached, so cheap) ------------------------
+        if source_count is None:
+            source_count = src_df.count()
+        print("Source Record Count:", source_count)
+
+        # ---- Step 5: execute the sync ---------------------------------------
+        latest_df = _latest_target_df(target_table)
+        cached_dfs.append(latest_df)
+
+        result = deltaUpsertAndSync(
+            targetTable=target_table,
+            sourceQuery=None,
+            primaryKeys=primary_keys,
+            nonKeyColumns=effective_non_key_columns,
+            identityColumn=identity_column,
+            batchId=batch_id,
+            latestDf=latest_df,
+            stagedDf=sync_df,
+            keyLookup=key_lookup,
+        )
+
+        inserted_count = result["inserted"]
+        updated_count = result["updated"]
+        deleted_count = result["deleted"]
+        target_before_active = result["before_active"]
+        target_after_active = (
+            _active_target_count(target_table)
+            if exact_target_count else result["after_active"]
+        )
+
+        print("=" * 60)
+        print("SYNC COMPLETED")
+        print("Source Records :", source_count)
+        print("Inserted       :", inserted_count)
+        print("Updated        :", updated_count)
+        print("Deleted        :", deleted_count)
+        print("Target After   :", target_after_active)
+        print("=" * 60)
+
+        # ---- Step 6: SUCCESS batch row --------------------------------------
+        _update_batch_row(batch_table, batch_id, {
+            "BATCH_END_DTTM": datetime.now(),
+            "STATUS": "SUCCESS",
+            "SOURCE_RECORD_COUNT": source_count,
+            "INSERTED_RECORD_COUNT": inserted_count,
+            "UPDATED_RECORD_COUNT": updated_count,
+            "DELETED_RECORD_COUNT": deleted_count,
+            "TOTAL_TARGET_COUNT": target_after_active,
+            "ERROR_MESSAGE": None,
+        })
+
+        return {
+            "batch_id": batch_id,
+            "num_inserted_rows": inserted_count,
+            "num_updated_rows": updated_count,
+            "num_deleted_rows": deleted_count,
+            "target_before_active": target_before_active,
+            "target_after_active": target_after_active,
+        }
+
+    except Exception as e:
+        if lock_held:
+            _CONTROL_LOCK.release()
+            lock_held = False
+        print("PIPELINE FAILED:", pipeline_name, "-", str(e))
+
+        if batch_id is not None:
+            _update_batch_row(batch_table, batch_id, {
+                "BATCH_END_DTTM": datetime.now(),
+                "STATUS": "FAILED",
+                "ERROR_MESSAGE": str(e),
+            })
+        else:
+            print("Pipeline failed before batch record was created:", str(e))
+
+        raise
+
+    finally:
+        if lock_held:
+            _CONTROL_LOCK.release()
+        for v in temp_views:
+            try:
+                spark.catalog.dropTempView(v)
+            except Exception:
+                pass
+        for d in cached_dfs:
+            try:
+                d.unpersist()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Sequential runner -- one pipeline at a time, bounded resource use
+# ============================================================================
+
+def run_all_pipelines(
+    pipeline_configs,
+    continue_on_error=True,
+    pause_seconds=0,
+    optimize_after=False,
+    clear_cache_between=True,
+    tune_spark=True,
+):
+    """
+    Runs the configs strictly one after another in this single Spark session, so
+    total consumption is one session's worth instead of N overlapping ones.
+    (Deliberately not threaded: concurrent runs would race on BATCH_ID and on
+    surrogate-key max().)
+
+    continue_on_error : a failed pipeline is logged and the loop moves on.
+    pause_seconds     : idle gap between pipelines to smooth capacity spikes.
+    optimize_after    : run OPTIMIZE on the target after a successful load
+                        (extra compute; better done as a separate weekly job).
+    """
+    if tune_spark:
+        configure_spark_for_efficiency()
+
+    summary = {}
+    total = len(pipeline_configs)
+
+    for i, cfg in enumerate(pipeline_configs, start=1):
+        name = cfg["pipeline_name"]
+        print(f"\n##### [{i}/{total}] {name} #####")
+        t0 = time.time()
+        try:
+            res = run_batch_tracked_merge(**{k: v for k, v in cfg.items() if k != "depends_on"})
+            summary[name] = {"status": "SUCCESS", **res,
+                             "seconds": round(time.time() - t0, 1)}
+            if optimize_after:
+                print("Optimizing:", cfg["target_table"])
+                spark.sql(f"OPTIMIZE {cfg['target_table']}")
+        except Exception as e:
+            summary[name] = {"status": "FAILED", "error": str(e),
+                             "seconds": round(time.time() - t0, 1)}
+            if not continue_on_error:
+                raise
+        finally:
+            if clear_cache_between:
+                spark.catalog.clearCache()
+
+        if pause_seconds and i < total:
+            time.sleep(pause_seconds)
+
+    print("\n" + "=" * 60)
+    print("RUN SUMMARY")
+    for n, s in summary.items():
+        print(f"  {n}: {s['status']} ({s['seconds']}s)")
+    print("=" * 60)
+
+    failed = [n for n, s in summary.items() if s["status"] == "FAILED"]
+    if failed:
+        print("Failed pipelines:", failed)
+
+    return summary
+
+
+# ============================================================================
+# Usage (in the notebook, after pipeline_configs is defined):
+#
+#   summary = run_all_pipelines(pipeline_configs, pause_seconds=30)
+# ============================================================================
 
