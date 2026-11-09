@@ -1,10 +1,2066 @@
-SELECT TOP 15 RUN_ID, STATUS, SESSION_START_DTTM, RUN_START_DTTM
-FROM ALLERGY_DELTA.ALLERGY_ETL_RUN_LOG ORDER BY RUN_ID DESC;
+# ============================================================================
+# CONFIG_NB (latest active version)
+#
+# Same as optimized_v2/CONFIG_NB.py, except: a query that joins one of OUR
+# target tables (TBL_PAT_ID, TBL_APP_NOTE, TBL_ALLERGY_FLWSHT,
+# TBL_ALLERGY_LABS_POP / _RESULTS / _PATHOLOGY) now reads only its LATEST
+# ACTIVE rows, not the whole history. Those tables are append-only: every
+# change adds a new version and a delete adds a soft-deleted version, so
+# joining the raw table also picked up old and deleted versions (duplicate or
+# stale rows). MEDS, OR_REPORT, NOTES_C and VISITS (flowsheet) already did this.
+#
+# Latest active = newest version per ROW_HASH (DW_UPDATED_AT, then BATCH_ID),
+# and that version is not soft-deleted. This is the same rule MERGE_NB uses.
+# The table name stays in the query text, so the orchestrator still sees
+# which pipeline depends on which.
+# ============================================================================
+
+def latest_active(table):
+    return f"""(
+                SELECT * FROM (
+                    SELECT LA.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY LA.ROW_HASH
+                               ORDER BY LA.DW_UPDATED_AT DESC, LA.BATCH_ID DESC
+                           ) AS LATEST_RN
+                    FROM {table} LA
+                ) LA_V
+                WHERE LA_V.LATEST_RN = 1 AND COALESCE(LA_V.IS_DELETED, 0) = 0
+            )"""
+
+
+ACTIVE_TBL_PAT_ID = latest_active("ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID")
+ACTIVE_TBL_APP_NOTE = latest_active("ALLERGY_LH.ALLERGY_DELTA.TBL_APP_NOTE")
+ACTIVE_TBL_ALLERGY_FLWSHT = latest_active("ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_FLWSHT")
+ACTIVE_TBL_ALLERGY_LABS_POP = latest_active("ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_POP")
+ACTIVE_TBL_ALLERGY_LABS_RESULTS = latest_active("ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_RESULTS")
+ACTIVE_TBL_ALLERGY_LABS_PATHOLOGY = latest_active("ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_PATHOLOGY")
+
+pipeline_configs = [
+        {
+        "pipeline_name": "TBL_PAT_ID",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            WITH pat_ids AS (
+                SELECT PE.PAT_ID
+                FROM CLARITY_LH.CLARITY.PAT_ENC PE
+                WHERE PE.DEPARTMENT_ID IN (SELECT DEPARTMENT_ID FROM ALLERGY_LH.ALLERGY.TBL_CCED_DEPTS)
+                UNION
+                SELECT TRAN.INT_PAT_ID
+                FROM CLARITY_LH.CLARITY.CLARITY_TDL_TRAN TRAN
+                WHERE TRAN.BILLING_PROVIDER_ID IN (SELECT PROV_ID FROM ALLERGY_LH.ALLERGY.TBL_CCED_PROVIDERS)
+            )
+            SELECT P.PAT_ID, P.PAT_MRN_ID
+            FROM CLARITY_LH.CLARITY.PATIENT P
+            INNER JOIN pat_ids I ON I.PAT_ID = P.PAT_ID
+        """,
+        "primary_keys": "PAT_ID",
+        "non_key_columns": "PAT_MRN_ID",
+        "identity_column": "PAT_ID_KEY",
+        "load_type": "FULL",
+    },
+
+    {
+        "pipeline_name": "TBL_ALLERGY_PAT_ENC",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            SELECT DISTINCT
+                PE.PAT_ID,
+                P.PAT_MRN_ID,
+                PE.PAT_ENC_CSN_ID
+
+            FROM ALLERGY_LH.ALLERGY.TBL_CCED_DEPTS CCED
+
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON PE.DEPARTMENT_ID = CCED.DEPARTMENT_ID
+
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT P
+                ON PE.PAT_ID = P.PAT_ID
+
+            UNION
+
+            SELECT DISTINCT
+                PAT.PAT_ID,
+                PAT.PAT_MRN_ID,
+                TRAN.PAT_ENC_CSN_ID
+
+            FROM CLARITY_LH.CLARITY.CLARITY_TDL_TRAN TRAN
+
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PAT
+                ON TRAN.INT_PAT_ID = PAT.PAT_ID
+
+            INNER JOIN ALLERGY_LH.ALLERGY.TBL_CCED_PROVIDERS PROV
+                ON TRAN.BILLING_PROVIDER_ID = PROV.PROV_ID
+                WHERE tran.pat_enc_csn_ID IS NOT NULL;
+        """,
+        "primary_keys": "PAT_ID, PAT_ENC_CSN_ID",
+        "non_key_columns": "PAT_MRN_ID",
+        "identity_column": "ALLERGY_PAT_ENC_KEY",
+        "load_type": "FULL",
+    },
 
 
 
-@concat('orch_', replace(guid(), '-', ''))
+    {
+        "pipeline_name": "TBL_VISITS_FLOWSHEET_MEASURE",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_VISITS_FLOWSHEET_MEASURE",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            WITH fm AS (
+        SELECT id AS flo_meas_id,
+            measurement_id AS grp_flo_meas_id
+        FROM (
+            SELECT id,
+                line,
+                measurement_id,
+                contact_date_real,
+                RANK() OVER (PARTITION BY id ORDER BY contact_date_real DESC) AS r
+            FROM CLARITY_LH.CLARITY.IP_FLO_MEASUREMNTS
+        )
+        WHERE r = 1
+        ),
+        ranked AS (
+            SELECT
+                pe.pat_enc_csn_id AS pat_enc_csn_id,
+                pe.pat_id AS pat_id,
+                fd.template_id AS template_id,
+                gpd2.flo_meas_id AS row_meas_id,
+                flm.meas_value,
+                RANK() OVER (
+                    PARTITION BY pe.pat_enc_csn_id, pe.pat_id, fd.template_id, gpd2.flo_meas_id
+                    ORDER BY flm.recorded_time DESC
+                ) AS r
+            FROM {ACTIVE_TBL_PAT_ID} mvp,
+                CLARITY_LH.CLARITY.IP_FLT_DATA fd,
+                CLARITY_LH.CLARITY.IP_FLT_COMPS cm,
+                fm,
+                CLARITY_LH.CLARITY.IP_FLO_GP_DATA gpd2,
+                CLARITY_LH.CLARITY.IP_FLWSHT_MEAS flm,
+                CLARITY_LH.CLARITY.IP_FLWSHT_REC fr,
+                CLARITY_LH.CLARITY.PAT_ENC pe
+            WHERE cm.template_id = fd.template_id
+            AND fm.flo_meas_id = cm.flo_meas_id
+            AND gpd2.flo_meas_id = fm.grp_flo_meas_id
+            AND flm.flo_meas_id = fm.grp_flo_meas_id
+            AND fr.fsd_id = flm.fsd_id
+            AND pe.inpatient_data_id = fr.inpatient_data_id
+            AND pe.pat_id = mvp.pat_id
+            AND fd.template_id = '103'
+            AND gpd2.flo_meas_id IN ('3478', '3480', '3481', '3488')
+        )
+        SELECT
+            pat_enc_csn_id,
+            pat_id,
+            template_id,
+            row_meas_id,
+            MAX(meas_value) AS percentile_value
+        FROM ranked
+        WHERE r = 1
+        GROUP BY pat_enc_csn_id, pat_id, template_id, row_meas_id;
+            """,
+            "primary_keys": "PAT_ENC_CSN_ID, PAT_ID, ROW_MEAS_ID",
+            "non_key_columns": "TEMPLATE_ID, PERCENTILE_VALUE",
+            "identity_column": "VISITS_FLOWSHEET_MEASURE_KEY",
+            "load_type": "FULL",
+    },
 
-@activity('Run Orchestrator').output.result.exitValue
+    {
+        "pipeline_name": "TBL_APP_NOTE",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_APP_NOTE",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            SELECT
+                PEAN.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                PEAN.PAT_ID AS PAT_ID,
+                ARRAY_JOIN(
+                    ARRAY_DISTINCT(
+                        TRANSFORM(
+                            SORT_ARRAY(
+                                COLLECT_LIST(STRUCT(PEAN.LINE AS LINE, LTRIM(PEAN.APPT_NOTE) AS APPT_NOTE))
+                            ),
+                            X -> X.APPT_NOTE
+                        )
+                    ),
+                    ','
+                ) AS APPOINTMENT_NOTES
+            FROM CLARITY_LH.CLARITY.PAT_ENC_APPT_NOTES PEAN
+            GROUP BY PEAN.PAT_ENC_CSN_ID, PEAN.PAT_ID
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ENC_CSN_ID, PAT_ID, APPOINTMENT_NOTES",
+        "identity_column": "APP_NOTE_KEY",
+        "load_type": "FULL",
+    },
 
-@equals(variables('loop_status'),'FAILED'
+
+    {
+        "pipeline_name": "TBL_ALLERGY_ALLERGY",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_ALLERGY",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT DISTINCT
+                PAT.PAT_ID AS PAT_ID,
+                PAT.PAT_MRN_ID AS PAT_MRN_ID,
+                ALLERGEN_NAME AS ALLERGEN_NAME,
+                ZR.NAME AS REACTION,
+                ZA.NAME AS ALLERGENTYPE,
+                A.REACTION AS ALLERGYCOMMENT,
+                G.ALLERGEN_TYPE_C AS ALLERGEN_TYPE_C,
+                ZAS.NAME AS STATUS,
+                A.ENTRY_USER_ID AS UPDATED_BY,
+                A.DATE_NOTED AS ALLERGY_DATE,
+                A.ENTERED_DATE AS ENTERED_DATE
+            -- v2: TBL_PAT_ID and PAT_ALLERGIES only filter patients (no column is
+            -- selected from them) -> LEFT SEMI JOIN. Same rows under DISTINCT,
+            -- without multiplying each patient's rows by the PAT_ALLERGIES row count.
+            FROM CLARITY_LH.CLARITY.PATIENT PAT
+            LEFT SEMI JOIN {ACTIVE_TBL_PAT_ID} CCED
+                ON PAT.PAT_ID = CCED.PAT_ID
+            LEFT SEMI JOIN CLARITY_LH.CLARITY.PAT_ALLERGIES PA
+                ON PAT.PAT_ID = PA.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ALLERGY A
+                ON PAT.PAT_ID = A.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ALLERGY_REACTIONS R
+                ON A.ALLERGY_ID = R.ALLERGY_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CL_ELG G
+                ON A.ALLERGEN_ID = G.ALLERGEN_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_REACTION ZR
+                ON R.REACTION_C = ZR.REACTION_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_ALLERGEN_TYPE ZA
+                ON G.ALLERGEN_TYPE_C = ZA.ALLERGEN_TYPE_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_ALRGY_STATUS ZAS
+                ON A.ALRGY_STATUS_C = ZAS.ALRGY_STATUS_C
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID, PAT_MRN_ID, ALLERGEN_NAME, REACTION, ALLERGENTYPE, ALLERGYCOMMENT, ALLERGEN_TYPE_C, STATUS, UPDATED_BY, ALLERGY_DATE, ENTERED_DATE",
+        "identity_column": "ALLERGY_ALLERGY_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_APPT",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_APPT",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            -- v2: OPN / OPD aggregate PAT_ENC_APPT only for encounters of patients in
+            -- TBL_PAT_ID (ENC_CSN) instead of all of Clarity. They are per-CSN
+            -- aggregates and are only LEFT JOINed on those CSNs -> same values.
+            WITH ENC_CSN AS (
+                SELECT PE0.PAT_ENC_CSN_ID
+                FROM CLARITY_LH.CLARITY.PAT_ENC PE0
+                LEFT SEMI JOIN {ACTIVE_TBL_PAT_ID} M0
+                    ON PE0.PAT_ID = M0.PAT_ID
+            ),
+            OPN AS (
+                SELECT
+                    APT.PAT_ENC_CSN_ID,
+                    ARRAY_JOIN(
+                        ARRAY_DISTINCT(
+                            TRANSFORM(
+                                SORT_ARRAY(
+                                    COLLECT_LIST(STRUCT(APT.LINE AS LINE, LTRIM(SER1.PROV_NAME) AS PROV_NAME))
+                                ),
+                                X -> X.PROV_NAME
+                            )
+                        ),
+                        ','
+                    ) AS OTHER_PROVIDER_NAME
+                FROM CLARITY_LH.CLARITY.PAT_ENC_APPT APT
+                LEFT SEMI JOIN ENC_CSN ON ENC_CSN.PAT_ENC_CSN_ID = APT.PAT_ENC_CSN_ID
+                INNER JOIN CLARITY_LH.CLARITY.CLARITY_SER SER1
+                    ON SER1.PROV_ID = APT.PROV_ID
+                WHERE APT.LINE <> 1
+                GROUP BY APT.PAT_ENC_CSN_ID
+            ),
+            OPD AS (
+                SELECT
+                    APT.PAT_ENC_CSN_ID,
+                    ARRAY_JOIN(
+                        ARRAY_DISTINCT(
+                            TRANSFORM(
+                                SORT_ARRAY(
+                                    COLLECT_LIST(STRUCT(APT.LINE AS LINE, LTRIM(DEP.DEPARTMENT_NAME) AS DEPARTMENT_NAME))
+                                ),
+                                X -> X.DEPARTMENT_NAME
+                            )
+                        ),
+                        ','
+                    ) AS OTHER_DEPARTMENT_NAME
+                FROM CLARITY_LH.CLARITY.PAT_ENC_APPT APT
+                LEFT SEMI JOIN ENC_CSN ON ENC_CSN.PAT_ENC_CSN_ID = APT.PAT_ENC_CSN_ID
+                INNER JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                    ON DEP.DEPARTMENT_ID = APT.DEPARTMENT_ID
+                WHERE APT.LINE <> 1
+                GROUP BY APT.PAT_ENC_CSN_ID
+            )
+            SELECT
+                PAT.PAT_NAME AS PAT_NAME,
+                SEX.NAME AS SEX,
+                PAT.BIRTH_DATE AS BIRTH_DATE,
+                PAT.PAT_MRN_ID AS PAT_MRN_ID,
+                PE.PAT_ID AS PAT_ID,
+                PE.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                PE.APPT_TIME AS APPT_TIME,
+                PE.APPT_MADE_DATE AS APPT_MADE_DATE,
+                PE.APPT_LENGTH AS APPT_LENGTH,
+                PE.APPT_STATUS_C AS APPT_STATUS_C,
+                PE.REFERRAL_SOURCE_ID AS REFERRAL_SOURCE_ID,
+                RS.REFERRING_PROV_NAM AS REFERRING_PROV_NAME,
+                ZAS.NAME AS APPT_STATUS,
+                ZDET.NAME AS ENC_TYPE_TITLE,
+                PRC.PRC_NAME AS VISIT_TYPE,
+                SER.PROV_ID AS PRIM_PROVIDER_ID,
+                SER.PROV_NAME AS PRIM_PROVIDER_NAME,
+                PE.DEPARTMENT_ID AS VISIT_PROVIDER_DEPARTMENT_ID,
+                DEP.DEPARTMENT_NAME AS VISIT_PROVIDER_DEPARTMENT,
+                SER2.PROV_ID AS VISIT_PROVIDER_ID,
+                SER2.PROV_NAME AS VISIT_PROVIDER,
+                OPN.OTHER_PROVIDER_NAME AS OTHER_PROVIDER_NAME,
+                OPD.OTHER_DEPARTMENT_NAME AS OTHER_DEPARTMENT_NAME,
+                APN.APPOINTMENT_NOTES AS APPOINTMENT_NOTES
+            FROM {ACTIVE_TBL_PAT_ID} MVP
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PAT
+                ON PAT.PAT_ID = MVP.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON PE.PAT_ID = PAT.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                ON DEP.DEPARTMENT_ID = PE.DEPARTMENT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_PRC PRC
+                ON PRC.PRC_ID = PE.APPT_PRC_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_APPT_STATUS ZAS
+                ON ZAS.APPT_STATUS_C = PE.APPT_STATUS_C
+            LEFT JOIN CLARITY_LH.CLARITY.REFERRAL_SOURCE RS
+                ON RS.REFERRING_PROV_ID = PE.REFERRAL_SOURCE_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER SER
+                ON SER.PROV_ID = PAT.CUR_PCP_PROV_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER SER2
+                ON SER2.PROV_ID = PE.VISIT_PROV_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_SEX SEX
+                ON SEX.RCPT_MEM_SEX_C = PAT.SEX_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_DISP_ENC_TYPE ZDET
+                ON ZDET.DISP_ENC_TYPE_C = PE.ENC_TYPE_C
+            LEFT JOIN OPN
+                ON OPN.PAT_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+            LEFT JOIN OPD
+                ON OPD.PAT_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+            LEFT JOIN {ACTIVE_TBL_APP_NOTE} APN
+                ON APN.PAT_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_NAME, SEX, BIRTH_DATE, PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_TIME, APPT_MADE_DATE, APPT_LENGTH, APPT_STATUS_C, REFERRAL_SOURCE_ID, REFERRING_PROV_NAME, APPT_STATUS, ENC_TYPE_TITLE, VISIT_TYPE, PRIM_PROVIDER_ID, PRIM_PROVIDER_NAME, VISIT_PROVIDER_DEPARTMENT_ID, VISIT_PROVIDER_DEPARTMENT, VISIT_PROVIDER_ID, VISIT_PROVIDER, OTHER_PROVIDER_NAME, OTHER_DEPARTMENT_NAME, APPOINTMENT_NOTES",
+        "identity_column": "ALLERGY_APPT_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_DEMOGRAPHICS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_DEMOGRAPHICS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            WITH RACE_AGG AS (
+                SELECT
+                    PR.PAT_ID AS PAT_ID,
+                    ARRAY_JOIN(
+                        ARRAY_DISTINCT(
+                            TRANSFORM(
+                                SORT_ARRAY(
+                                    COLLECT_LIST(STRUCT(PR.LINE AS LINE, LTRIM(ZPR.NAME) AS RACE))
+                                ),
+                                X -> X.RACE
+                            )
+                        ),
+                        ','
+                    ) AS RACE
+                FROM CLARITY_LH.CLARITY.PATIENT_RACE PR
+                INNER JOIN CLARITY_LH.CLARITY.ZC_PATIENT_RACE ZPR
+                    ON ZPR.PATIENT_RACE_C = PR.PATIENT_RACE_C
+                GROUP BY PR.PAT_ID
+            )
+            SELECT
+                PAT.PAT_MRN_ID AS PAT_MRN_ID,
+                PAT.PAT_ID AS PAT_ID,
+                PAT.PAT_NAME AS PAT_NAME,
+                PAT.PAT_FIRST_NAME AS PAT_FIRST_NAME,
+                PAT.PAT_MIDDLE_NAME AS PAT_MIDDLE_NAME,
+                PAT.PAT_LAST_NAME AS PAT_LAST_NAME,
+                PAT.BIRTH_DATE AS BIRTH_DATE,
+                ZSEX.NAME AS SEX,
+                MAX(RACE_AGG.RACE) AS RACE,
+                ZEG.NAME AS ETHNICITY,
+                ZMS.NAME AS MARITAL_STATUS,
+                EC.FATHER_NAME AS FATHER_NAME,
+                EC.MOTHER_NAME AS MOTHER_NAME,
+                EC.GUARDIAN_NAME AS GUARDIAN_NAME,
+                PAT.ADD_LINE_1 AS ADD_LINE_1,
+                PAT.ADD_LINE_2 AS ADD_LINE_2,
+                PAT.CITY AS CITY,
+                ZST.NAME AS STATE,
+                PAT.ZIP AS ZIP,
+                ZCTRY.NAME AS COUNTRY,
+                ZCNTY.NAME AS COUNTY,
+                PAT.HOME_PHONE AS HOME_PHONE,
+                PAT.WORK_PHONE AS WORK_PHONE,
+                PAT.EMAIL_ADDRESS AS EMAIL_ADDRESS,
+                ZPS.NAME AS PAT_STATUS,
+                PAT.DEATH_DATE AS DEATH_DATE,
+                SER.PROV_NAME AS PROV_NAME
+            -- v2: TBL_PAT_ID and PAT_ENC only decide WHICH patients (no column is
+            -- selected from them, result is GROUP BY + MAX) -> LEFT SEMI JOIN.
+            -- Same rows, without one copy of each patient per encounter.
+            FROM CLARITY_LH.CLARITY.PATIENT PAT
+            LEFT SEMI JOIN {ACTIVE_TBL_PAT_ID} CCED
+                ON PAT.PAT_ID = CCED.PAT_ID
+            LEFT SEMI JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON PAT.PAT_ID = PE.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_SEX ZSEX
+                ON PAT.SEX_C = ZSEX.RCPT_MEM_SEX_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_STATE ZST
+                ON PAT.STATE_C = ZST.STATE_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_COUNTRY ZCTRY
+                ON PAT.COUNTRY_C = ZCTRY.COUNTRY_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_COUNTY ZCNTY
+                ON PAT.COUNTY_C = ZCNTY.COUNTY_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_ETHNIC_GROUP ZEG
+                ON PAT.ETHNIC_GROUP_C = ZEG.ETHNIC_GROUP_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_MARITAL_STATUS ZMS
+                ON PAT.MARITAL_STATUS_C = ZMS.MARITAL_STATUS_C
+            LEFT JOIN CLARITY_LH.CLARITY.EMERGENCY_CONTACTS EC
+                ON PAT.PAT_ID = EC.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER SER
+                ON PAT.CUR_PCP_PROV_ID = SER.PROV_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_PATIENT_STATUS ZPS
+                ON PAT.PAT_STATUS_C = ZPS.PATIENT_STATUS_C
+            LEFT JOIN RACE_AGG
+                ON RACE_AGG.PAT_ID = PAT.PAT_ID
+            GROUP BY
+                PAT.PAT_MRN_ID,
+                PAT.PAT_ID,
+                PAT.PAT_NAME,
+                PAT.PAT_FIRST_NAME,
+                PAT.PAT_MIDDLE_NAME,
+                PAT.PAT_LAST_NAME,
+                PAT.BIRTH_DATE,
+                ZSEX.NAME,
+                ZEG.NAME,
+                ZMS.NAME,
+                EC.FATHER_NAME,
+                EC.MOTHER_NAME,
+                EC.GUARDIAN_NAME,
+                PAT.ADD_LINE_1,
+                PAT.ADD_LINE_2,
+                PAT.CITY,
+                ZST.NAME,
+                PAT.ZIP,
+                ZCTRY.NAME,
+                ZCNTY.NAME,
+                PAT.HOME_PHONE,
+                PAT.WORK_PHONE,
+                PAT.EMAIL_ADDRESS,
+                ZPS.NAME,
+                PAT.DEATH_DATE,
+                SER.PROV_NAME
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_MRN_ID, PAT_ID, PAT_NAME, PAT_FIRST_NAME, PAT_MIDDLE_NAME, PAT_LAST_NAME, BIRTH_DATE, SEX, RACE, ETHNICITY, MARITAL_STATUS, FATHER_NAME, MOTHER_NAME, GUARDIAN_NAME, ADD_LINE_1, ADD_LINE_2, CITY, STATE, ZIP, COUNTRY, COUNTY, HOME_PHONE, WORK_PHONE, EMAIL_ADDRESS, PAT_STATUS, DEATH_DATE, PROV_NAME",
+        "identity_column": "ALLERGY_DEMOGRAPHICS_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_DX",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_DX",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT
+                PAT.PAT_ID AS PAT_ID,
+                PAT.PAT_MRN_ID AS PAT_MRN_ID,
+                PE.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                PE.CONTACT_DATE AS CONTACT_DATE,
+                PE.ENC_CLOSED_YN AS ENC_CLOSED_YN,
+                PE.ENC_CLOSE_DATE AS ENC_CLOSE_DATE,
+                CP.PRC_NAME AS PRC_NAME,
+                ZDET.NAME AS ENC_TYPE_TITLE,
+                DX.PRIMARY_DX_YN AS PRIMARY_DX_YN,
+                DX.DX_CHRONIC_YN AS DX_CHRONIC_YN,
+                DX.COMMENTS AS COMMENTS,
+                G.DX_NAME AS DX_NAME,
+                G.DX_GROUP AS DX_GROUP,
+                G.CURRENT_ICD9_LIST AS ICD9_CODE,
+                G.CURRENT_ICD10_LIST AS ICD10_CODE,
+                Q.NAME AS QUALIFIER_NAME,
+                PE.DEPARTMENT_ID AS DEPARTMENT_ID,
+                DEP.DEPARTMENT_NAME AS DEPARTMENT_NAME,
+                'encounter_dx' AS DX_SOURCE
+            FROM {ACTIVE_TBL_PAT_ID} MVP
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PAT
+                ON PAT.PAT_ID = MVP.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON PAT.PAT_ID = PE.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC_DX DX
+                ON DX.PAT_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_EDG G
+                ON DX.DX_ID = G.DX_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_DX_QUALIFIER Q
+                ON CAST(DX.DX_QUALIFIER_C AS STRING) = Q.DX_QUALIFIER_C
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_PRC CP
+                ON PE.APPT_PRC_ID = CP.PRC_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                ON PE.DEPARTMENT_ID = DEP.DEPARTMENT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_DISP_ENC_TYPE ZDET
+                ON PE.ENC_TYPE_C = ZDET.DISP_ENC_TYPE_C
+
+            UNION
+
+            SELECT
+                P.PAT_ID AS PAT_ID,
+                P.PAT_MRN_ID AS PAT_MRN_ID,
+                PE.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                PE.CONTACT_DATE AS CONTACT_DATE,
+                PE.ENC_CLOSED_YN AS ENC_CLOSED_YN,
+                PE.ENC_CLOSE_DATE AS ENC_CLOSE_DATE,
+                CP.PRC_NAME AS PRC_NAME,
+                ZDET.NAME AS ENC_TYPE_TITLE,
+                CASE WHEN HADL.LINE = 1 THEN 'Y' ELSE 'N' END AS PRIMARY_DX_YN,
+                CAST(NULL AS STRING) AS DX_CHRONIC_YN,
+                CAST(NULL AS STRING) AS COMMENTS,
+                EDG.DX_NAME AS DX_NAME,
+                EDG.DX_GROUP AS DX_GROUP,
+                EDG.CURRENT_ICD9_LIST AS ICD9_CODE,
+                EDG.CURRENT_ICD10_LIST AS ICD10_CODE,
+                CAST(NULL AS STRING) AS QUALIFIER_NAME,
+                PE.DEPARTMENT_ID AS DEPARTMENT_ID,
+                DEP.DEPARTMENT_NAME AS DEPARTMENT_NAME,
+                'discharge_dx' AS DX_SOURCE
+            FROM {ACTIVE_TBL_PAT_ID} MVP
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT P
+                ON MVP.PAT_ID = P.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.HSP_ACCOUNT HAR
+                ON MVP.PAT_ID = HAR.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.HSP_ACCT_DX_LIST HADL
+                ON HAR.HSP_ACCOUNT_ID = HADL.HSP_ACCOUNT_ID
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_EDG EDG
+                ON HADL.DX_ID = EDG.DX_ID
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON HAR.PRIM_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_PRC CP
+                ON PE.APPT_PRC_ID = CP.PRC_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                ON PE.DEPARTMENT_ID = DEP.DEPARTMENT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_DISP_ENC_TYPE ZDET
+                ON PE.ENC_TYPE_C = ZDET.DISP_ENC_TYPE_C
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID, PAT_MRN_ID, PAT_ENC_CSN_ID, CONTACT_DATE, ENC_CLOSED_YN, ENC_CLOSE_DATE, PRC_NAME, ENC_TYPE_TITLE, PRIMARY_DX_YN, DX_CHRONIC_YN, COMMENTS, DX_NAME, DX_GROUP, ICD9_CODE, ICD10_CODE, QUALIFIER_NAME, DEPARTMENT_ID, DEPARTMENT_NAME, DX_SOURCE",
+        "identity_column": "ALLERGY_DX_KEY",
+        "load_type": "FULL",
+    },
+
+    {
+        "pipeline_name": "TBL_ALLERGY_FAMMED_HX",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_FAMMED_HX",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT DISTINCT
+                PAT.PAT_ID AS PAT_ID,
+                FHX.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                FHX.HX_LNK_ENC_CSN AS HISTORY_ENC_CSN,
+                FHX.CONTACT_DATE AS CONTACT_DATE,
+                DEP.DEPARTMENT_NAME AS VISIT_DEPARTMENT_NAME,
+                ZHX.NAME AS MEDICAL_CONDITION,
+                FHX.MEDICAL_OTHER AS MEDICAL_OTHER,
+                ZMC.NAME AS RELATION,
+                FHX.COMMENTS AS COMMENTS,
+                FHX.FAM_RELATION_NAME AS FAM_RELATION_NAME,
+                ZHC.NAME AS HISTORY_SOURCE,
+                FHX.LINE AS LINE
+            FROM {ACTIVE_TBL_PAT_ID} MVP
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PAT
+                ON PAT.PAT_ID = MVP.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON PE.PAT_ID = PAT.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.FAMILY_HX FHX
+                ON PAT.PAT_ID = FHX.PAT_ID
+               AND FHX.PAT_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                ON PE.DEPARTMENT_ID = DEP.DEPARTMENT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_MEDICAL_HX ZHX
+                ON FHX.MEDICAL_HX_C = ZHX.MEDICAL_HX_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_HISTORY_SOURCE ZHC
+                ON FHX.FAM_HX_SRC_C = ZHC.HISTORY_SOURCE_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_MSG_CALLER_REL ZMC
+                ON FHX.RELATION_C = ZMC.MSG_CALLER_REL_C
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID, PAT_ENC_CSN_ID, HISTORY_ENC_CSN, CONTACT_DATE, VISIT_DEPARTMENT_NAME, MEDICAL_CONDITION, MEDICAL_OTHER, RELATION, COMMENTS, FAM_RELATION_NAME, HISTORY_SOURCE, LINE",
+        "identity_column": "ALLERGY_FAMMED_HX_KEY",
+        "load_type": "FULL",
+    },
+
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_FLWSHT",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_FLWSHT",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            WITH FM AS (
+                SELECT ID AS FLO_MEAS_ID, MEASUREMENT_ID AS GRP_FLO_MEAS_ID
+                FROM (
+                    SELECT
+                        ID,
+                        LINE,
+                        MEASUREMENT_ID,
+                        CONTACT_DATE_REAL,
+                        RANK() OVER (PARTITION BY ID ORDER BY CONTACT_DATE_REAL DESC) AS R
+                    FROM CLARITY_LH.CLARITY.IP_FLO_MEASUREMNTS
+                )
+                WHERE R = 1
+            )
+            SELECT DISTINCT
+                FD.TEMPLATE_ID AS TEMPLATE_ID,
+                FD.TEMPLATE_NAME AS TEMPLATE_NAME,
+                FD.DISPLAY_NAME AS DISPLAY_NAME,
+                FD.TIME_INTERVAL AS TIME_INTERVAL,
+                GPD1.FLO_MEAS_ID AS FLO_MEAS_ID,
+                GPD1.ABBREVIATION AS GRP_ABB,
+                GPD1.DISP_NAME AS DISP_NAME,
+                PE.PAT_ID AS PAT_ID,
+                PE.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                PE.CONTACT_DATE AS CONTACT_DATE,
+                FLM.FLO_MEAS_ID AS MEAS_ID,
+                GPD2.DISP_NAME AS FLO_DIS_NAME,
+                FLM.MEAS_VALUE AS MEAS_VALUE,
+                CASE
+                    WHEN UPPER(ZVT.NAME) = 'DATE'
+                    THEN CAST(DATE_ADD(TO_DATE('1840-12-31'), CAST(FLM.MEAS_VALUE AS INT)) AS STRING)
+                    ELSE FLM.MEAS_VALUE
+                END AS MEAS_VALUE_CVERT,
+                FLM.MEAS_COMMENT AS MEAS_COMMENT,
+                FLM.LINE AS LINE,
+                DATE(FLM.RECORDED_TIME) AS RECORDED_DATE,
+                PAT.PAT_MRN_ID AS PAT_MRN_ID,
+                PE.DEPARTMENT_ID AS DEPARTMENT_ID,
+                CDEPT.DEPARTMENT_NAME AS DEPARTMENT_NAME,
+                FLM.RECORDED_TIME AS RECORDED_TIME,
+                FLM.ENTRY_TIME AS ENTRY_TIME,
+                FLM.ENTRY_USER_ID AS ENTRY_USER_ID
+            FROM CLARITY_LH.CLARITY.IP_FLT_DATA FD
+            INNER JOIN CLARITY_LH.CLARITY.IP_FLT_COMPS CM
+                ON CM.TEMPLATE_ID = FD.TEMPLATE_ID
+            INNER JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA GPD1
+                ON GPD1.FLO_MEAS_ID = CM.FLO_MEAS_ID
+            INNER JOIN FM
+                ON FM.FLO_MEAS_ID = CM.FLO_MEAS_ID
+            INNER JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA GPD2
+                ON GPD2.FLO_MEAS_ID = FM.GRP_FLO_MEAS_ID
+            INNER JOIN CLARITY_LH.CLARITY.IP_FLWSHT_MEAS FLM
+                ON FLM.FLO_MEAS_ID = FM.GRP_FLO_MEAS_ID
+            INNER JOIN CLARITY_LH.CLARITY.IP_FLWSHT_REC FR
+                ON FR.FSD_ID = FLM.FSD_ID
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
+                ON PE.INPATIENT_DATA_ID = FR.INPATIENT_DATA_ID
+            INNER JOIN {ACTIVE_TBL_PAT_ID} PAT
+                ON PAT.PAT_ID = PE.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP CDEPT
+                ON CDEPT.DEPARTMENT_ID = PE.DEPARTMENT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_VAL_TYPE ZVT
+                ON ZVT.VAL_TYPE_C = GPD2.VAL_TYPE_C
+            WHERE FD.TEMPLATE_ID IN (
+                '312','360','361','364','365','362',
+                '210401435','210400957','210401586','210401477','210401451','210401563',
+                '2100200032','2100200000','2100200222','2100200110','2100200166','2100200071',
+                '702','703','210101378','210100046',
+                '270','279','280',
+                '210001486','210001591','210001597'
+            )
+        """,
+        "primary_keys": "",
+        "non_key_columns": "TEMPLATE_ID, TEMPLATE_NAME, DISPLAY_NAME, TIME_INTERVAL, FLO_MEAS_ID, GRP_ABB, DISP_NAME, PAT_ID, PAT_ENC_CSN_ID, CONTACT_DATE, MEAS_ID, FLO_DIS_NAME, MEAS_VALUE, MEAS_VALUE_CVERT, MEAS_COMMENT, LINE, RECORDED_DATE, PAT_MRN_ID, DEPARTMENT_ID, DEPARTMENT_NAME, RECORDED_TIME, ENTRY_TIME, ENTRY_USER_ID",
+        "identity_column": "ALLERGY_FLWSHT_KEY",
+        "load_type": "FULL",
+    },
+
+    {
+        "pipeline_name": "TBL_ALLERGY_FLWSHT_LKP",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_FLWSHT_LKP",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            WITH B AS (
+                SELECT ID AS FLO_MEAS_ID, LINE AS LINE, MEASUREMENT_ID AS GRP_FLO_MEAS_ID
+                FROM (
+                    SELECT
+                        ID,
+                        LINE,
+                        MEASUREMENT_ID,
+                        CONTACT_DATE_REAL,
+                        RANK() OVER (PARTITION BY ID ORDER BY CONTACT_DATE_REAL DESC) AS R
+                    FROM CLARITY_LH.CLARITY.IP_FLO_MEASUREMNTS
+                )
+                WHERE R = 1
+            ),
+            CUST_LIST AS (
+                SELECT
+                    C.TEMPLATE_ID AS TEMPLATE_ID,
+                    IFD.DISPLAY_NAME AS TEMPLATE_NAME,
+                    C.LINE AS GRP_LINE,
+                    IFGD.FLO_DIS_NAME AS GRP_NAME,
+                    B.LINE AS MEAS_LINE,
+                    IFGD2.FLO_DIS_NAME AS MEAS_NAME,
+                    ZVT.NAME AS MEASURE_TYPE_NAME,
+                    C.FLO_MEAS_ID AS FLO_MEAS_ID,
+                    CONCAT('M_', B.GRP_FLO_MEAS_ID) AS MEAS_ID,
+                    A.LINE AS LIST_LINE,
+                    A.CUST_LIST AS CUST_LIST
+                FROM CLARITY_LH.CLARITY.IP_FLT_COMPS C
+                LEFT JOIN B
+                    ON B.FLO_MEAS_ID = C.FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLO_CUSTOM_LIST A
+                    ON A.ID = B.GRP_FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLT_DATA IFD
+                    ON IFD.TEMPLATE_ID = C.TEMPLATE_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA IFGD
+                    ON IFGD.FLO_MEAS_ID = C.FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA IFGD2
+                    ON IFGD2.FLO_MEAS_ID = B.GRP_FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_VAL_TYPE ZVT
+                    ON ZVT.VAL_TYPE_C = IFGD2.VAL_TYPE_C
+
+                UNION
+
+                SELECT
+                    C.TEMPLATE_ID AS TEMPLATE_ID,
+                    IFD.DISPLAY_NAME AS TEMPLATE_NAME,
+                    C.LINE AS GRP_LINE,
+                    IFGD.FLO_DIS_NAME AS GRP_NAME,
+                    B.LINE AS MEAS_LINE,
+                    IFGD2.FLO_DIS_NAME AS MEAS_NAME,
+                    ZVT.NAME AS MEASURE_TYPE_NAME,
+                    C.FLO_MEAS_ID AS FLO_MEAS_ID,
+                    CONCAT('M_', B.GRP_FLO_MEAS_ID) AS MEAS_ID,
+                    A.LINE AS LIST_LINE,
+                    A.CUST_LIST AS CUST_LIST
+                FROM CLARITY_LH.CLARITY.IP_FLO_CUSTOM_LIST A
+                LEFT JOIN B
+                    ON B.GRP_FLO_MEAS_ID = A.ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLT_COMPS C
+                    ON C.FLO_MEAS_ID = B.FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLT_DATA IFD
+                    ON IFD.TEMPLATE_ID = C.TEMPLATE_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA IFGD
+                    ON IFGD.FLO_MEAS_ID = C.FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA IFGD2
+                    ON IFGD2.FLO_MEAS_ID = B.GRP_FLO_MEAS_ID
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_VAL_TYPE ZVT
+                    ON ZVT.VAL_TYPE_C = IFGD2.VAL_TYPE_C
+            )
+            SELECT DISTINCT
+                CUST_LIST.TEMPLATE_ID AS TEMPLATE_ID,
+                CUST_LIST.TEMPLATE_NAME AS TEMPLATE_NAME,
+                CUST_LIST.GRP_LINE AS GRP_LINE,
+                CUST_LIST.GRP_NAME AS GRP_NAME,
+                CUST_LIST.MEAS_LINE AS MEAS_LINE,
+                CUST_LIST.MEAS_NAME AS MEAS_NAME,
+                CUST_LIST.MEASURE_TYPE_NAME AS MEASURE_TYPE_NAME,
+                CUST_LIST.FLO_MEAS_ID AS FLO_MEAS_ID,
+                CUST_LIST.MEAS_ID AS MEAS_ID,
+                CUST_LIST.LIST_LINE AS LIST_LINE,
+                CUST_LIST.CUST_LIST AS CUST_LIST
+            -- v2: TBL_ALLERGY_FLWSHT only filters templates (no column selected,
+            -- SELECT DISTINCT) -> semi join on its distinct TEMPLATE_IDs. Same rows,
+            -- without joining every list row to every flowsheet row of its template.
+            FROM CUST_LIST
+            LEFT SEMI JOIN (
+                SELECT DISTINCT TEMPLATE_ID
+                FROM {ACTIVE_TBL_ALLERGY_FLWSHT} F
+            ) MAF
+                ON CUST_LIST.TEMPLATE_ID = MAF.TEMPLATE_ID
+        """,
+        "primary_keys": "",
+        "non_key_columns": "TEMPLATE_ID, TEMPLATE_NAME, GRP_LINE, GRP_NAME, MEAS_LINE, MEAS_NAME, MEASURE_TYPE_NAME, FLO_MEAS_ID, MEAS_ID, LIST_LINE, CUST_LIST",
+        "identity_column": "ALLERGY_FLWSHT_LKP_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_LABS_POP",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_POP",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT pat.pat_mrn_id          AS pat_mrn_id,
+                   pe.pat_id               AS pat_id,
+                   pe.pat_enc_csn_id       AS pat_enc_csn_id,
+                   pe.appt_status_c        AS appt_status_c,
+                   pe.appt_prc_id          AS appt_prc_id,
+                   zdet.name               AS enc_type_title,
+                   pe.contact_date         AS contact_date,
+                   d.department_name       AS department_name,
+                   op.order_proc_id        AS order_proc_id,
+                   op.proc_code            AS proc_code,
+                   op.description          AS description,
+                   op.ordering_date        AS ordering_date,
+                   r.result_time           AS result_time,
+                   r.result_date           AS result_date,
+                   r.component_id          AS component_id,
+                   cc.name                 AS componentname,
+                   r.ord_value             AS ord_value,
+                   r.ord_num_value         AS ord_num_value,
+                   r.reference_unit        AS reference_unit,
+                   r.reference_low         AS reference_low,
+                   r.reference_high        AS reference_high,
+                   zrf.name                AS result_flag,
+                   r.lab_status_c          AS lab_status_c,
+                   CASE
+                       WHEN r.lab_status_c = 3 THEN 'Final Result'
+                       WHEN r.lab_status_c = 4 THEN 'Edited'
+                   END                     AS lab_status,
+                   rs.name                 AS resultstatus,
+                   pe.enc_closed_yn        AS enc_closed_yn,
+                   r.ord_date_real         AS ord_date_real,
+                   r.ord_end_date_real     AS ord_end_date_real,
+                   r.line,
+                   pe.department_id        AS department_id
+              FROM {ACTIVE_TBL_PAT_ID} mvp
+                   INNER JOIN clarity_lh.clarity.pat_enc pe
+                      ON mvp.pat_id = pe.pat_id
+                   INNER JOIN clarity_lh.clarity.patient pat
+                      ON pe.pat_id = pat.pat_id
+                   INNER JOIN clarity_lh.clarity.order_proc op
+                      ON pe.pat_enc_csn_id = op.pat_enc_csn_id
+                   LEFT OUTER JOIN clarity_lh.clarity.order_results r
+                      ON op.order_proc_id = r.order_proc_id
+                   LEFT OUTER JOIN clarity_lh.clarity.clarity_component cc
+                      ON r.component_id = cc.component_id
+                   LEFT OUTER JOIN clarity_lh.clarity.zc_result_status rs
+                      ON r.result_status_c = rs.result_status_c
+                   LEFT OUTER JOIN clarity_lh.clarity.clarity_dep d
+                      ON pe.department_id = d.department_id
+                   LEFT OUTER JOIN clarity_lh.clarity.zc_result_flag zrf
+                      ON r.result_flag_c = zrf.result_flag_c
+                   INNER JOIN clarity_lh.clarity.zc_disp_enc_type zdet
+                      ON pe.enc_type_c = zdet.disp_enc_type_c
+             WHERE  op.order_status_c IN (1, 2, 3, 5, 6, 9, 10, 11, 12)
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_STATUS_C, APPT_PRC_ID, ENC_TYPE_TITLE, CONTACT_DATE, DEPARTMENT_NAME, ORDER_PROC_ID, PROC_CODE, DESCRIPTION, ORDERING_DATE, RESULT_TIME, RESULT_DATE, COMPONENT_ID, COMPONENTNAME, ORD_VALUE, ORD_NUM_VALUE, REFERENCE_UNIT, REFERENCE_LOW, REFERENCE_HIGH, RESULT_FLAG, LAB_STATUS_C, LAB_STATUS, RESULTSTATUS, ENC_CLOSED_YN, ORD_DATE_REAL, ORD_END_DATE_REAL, LINE, DEPARTMENT_ID",
+        "identity_column": "ALLERGY_LABS_POP_KEY",
+        "load_type": "FULL",
+    },
+
+    {
+        "pipeline_name": "TBL_ALLERGY_LABS_RESULTS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_RESULTS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT pp.order_proc_id,
+                   pp.component_id,
+                   pp.line,
+                   REGEXP_REPLACE(
+                       CONCAT_WS(' ',
+                           TRANSFORM(
+                               SORT_ARRAY(
+                                   COLLECT_LIST(STRUCT(rc.line_comment AS ord, rc.results_comp_cmt AS txt))
+                               ),
+                               x -> x.txt
+                           )
+                       ),
+                       '<[/]?A>',
+                       ''
+                   ) AS result_text
+              FROM {ACTIVE_TBL_ALLERGY_LABS_POP} pp
+                   INNER JOIN clarity_lh.clarity.order_res_comp_cmt rc
+                           ON pp.order_proc_id = rc.order_id
+                          AND pp.component_id = rc.component_id
+                          AND pp.line = rc.line_comp
+             WHERE  rc.results_comp_cmt <> 'This result contains rich text formatting which cannot be displayed here.'
+             GROUP BY pp.order_proc_id, pp.component_id, pp.line
+        """,
+        "primary_keys": "",
+        "non_key_columns": "order_proc_id, component_id, line, RESULT_TEXT",
+        "identity_column": "ALLERGY_LABS_RESULTS_KEY",
+        "load_type": "FULL",
+    },
+
+    {
+        "pipeline_name": "TBL_ALLERGY_LABS_PATHOLOGY",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_PATHOLOGY",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT rdb.res_order_id                             AS order_proc_id,
+                   rc.component_id,
+                   COALESCE(cc.external_name, cc.name)          AS componentname,
+                   REGEXP_REPLACE(
+                       CONCAT_WS(' ',
+                           TRANSFORM(
+                               SORT_ARRAY(
+                                   COLLECT_LIST(STRUCT(dta.group_line AS grp, dta.value_line AS val, dta.mult_ln_val_storage AS txt))
+                               ),
+                               x -> x.txt
+                           )
+                       ),
+                       '<[/]?A>',
+                       ''
+                   ) AS result_text
+              FROM {ACTIVE_TBL_ALLERGY_LABS_POP} pp
+                   INNER JOIN clarity_lh.clarity.res_db_main rdb
+                           ON pp.order_proc_id = rdb.res_order_id
+                   INNER JOIN clarity_lh.clarity.res_components rc
+                           ON rdb.result_id = rc.result_id
+                          AND pp.component_id = rc.component_id
+                   INNER JOIN clarity_lh.clarity.clarity_component cc
+                           ON rc.component_id = cc.component_id
+                   INNER JOIN clarity_lh.clarity.res_val_ptr_rm ptr
+                           ON rc.result_id = ptr.result_id
+                          AND rc.line = ptr.group_line
+                   INNER JOIN clarity_lh.clarity.res_val_data_rm dta
+                           ON ptr.result_id = dta.result_id
+                          AND ptr.cmp_multiline_value = dta.group_line
+             GROUP BY rdb.res_order_id,
+                      rc.component_id,
+                      COALESCE(cc.external_name, cc.name)
+        """,
+        "primary_keys": "",
+        "non_key_columns": "order_proc_id, component_id, COMPONENTNAME, RESULT_TEXT",
+        "identity_column": "ALLERGY_LABS_PATHOLOGY_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_LABS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT pop.pat_mrn_id,
+                   pop.pat_id,
+                   pop.pat_enc_csn_id,
+                   pop.appt_status_c,
+                   pop.appt_prc_id,
+                   pop.enc_type_title,
+                   pop.contact_date,
+                   pop.department_name,
+                   pop.order_proc_id,
+                   pop.proc_code,
+                   pop.description,
+                   pop.ordering_date,
+                   pop.result_time,
+                   pop.result_date,
+                   pop.component_id,
+                   COALESCE(path_r.componentname, pop.componentname)   AS componentname,
+                   pop.ord_value,
+                   pop.ord_num_value,
+                   COALESCE(path_r.result_text, tst_r.result_text)     AS result_text,
+                   pop.reference_unit,
+                   pop.reference_low,
+                   pop.reference_high,
+                   pop.result_flag,
+                   pop.lab_status_c,
+                   CASE
+                       WHEN pop.lab_status_c = 3 THEN 'Final Result'
+                       WHEN pop.lab_status_c = 4 THEN 'Edited'
+                   END                                                 AS lab_status,
+                   pop.resultstatus,
+                   pop.enc_closed_yn,
+                   pop.ord_date_real,
+                   pop.ord_end_date_real,
+                   pop.line,
+                   pop.department_id
+              FROM   {ACTIVE_TBL_ALLERGY_LABS_POP} pop
+                   LEFT OUTER JOIN {ACTIVE_TBL_ALLERGY_LABS_RESULTS} tst_r
+                           ON pop.order_proc_id = tst_r.order_proc_id
+                          AND pop.component_id = tst_r.component_id
+                          AND pop.line = tst_r.line
+                   LEFT OUTER JOIN {ACTIVE_TBL_ALLERGY_LABS_PATHOLOGY} path_r
+                           ON pop.order_proc_id = path_r.order_proc_id
+                          AND pop.component_id = path_r.component_id
+        """,
+        "primary_keys": "",
+        "non_key_columns":
+        "PAT_MRN_ID, PAT_ID, PAT_ENC_CSN_ID, APPT_STATUS_C, APPT_PRC_ID, ENC_TYPE_TITLE,"
+        "CONTACT_DATE, DEPARTMENT_NAME, ORDER_PROC_ID, PROC_CODE, DESCRIPTION,"
+        "ORDERING_DATE, RESULT_TIME, RESULT_DATE, COMPONENT_ID, COMPONENTNAME, ORD_VALUE, ORD_NUM_VALUE, RESULT_TEXT,"
+        "REFERENCE_UNIT, REFERENCE_LOW, REFERENCE_HIGH, RESULT_FLAG, LAB_STATUS_C, LAB_STATUS, RESULTSTATUS,"
+        "ENC_CLOSED_YN, ORD_DATE_REAL, ORD_END_DATE_REAL, LINE, DEPARTMENT_ID",
+        "identity_column": "ALLERGY_LABS_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_MEDS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_MEDS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            WITH active_pat_ids AS (
+                SELECT PAT_ID
+                FROM (
+                    SELECT PAT_ID, IS_DELETED,
+                           ROW_NUMBER() OVER (PARTITION BY ROW_HASH
+                                              ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC) AS rn
+                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID
+                ) t
+                WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
+            ),
+            pat AS (
+                SELECT p.pat_id, p.pat_mrn_id
+                FROM CLARITY_LH.CLARITY.PATIENT p
+                LEFT SEMI JOIN active_pat_ids a ON p.pat_id = a.PAT_ID
+            ),
+            enc AS (
+                SELECT pat.pat_id, pat.pat_mrn_id, pe.pat_enc_csn_id, pe.appt_prc_id,
+                       pe.appt_status_c, pe.contact_date, pe.enc_close_date, pe.department_id
+                FROM CLARITY_LH.CLARITY.PAT_ENC pe
+                INNER JOIN pat ON pe.pat_id = pat.pat_id
+            ),
+            med_links AS (
+                SELECT 1 AS src_branch, pecm.pat_enc_csn_id,
+                       pecm.current_med_id AS order_med_id, pecm.is_active_yn
+                FROM CLARITY_LH.CLARITY.PAT_ENC_CURR_MEDS pecm
+                UNION ALL
+                SELECT 2 AS src_branch, peim.pat_enc_csn_id,
+                       peim.meds_inp_enc_ord_id AS order_med_id,
+                       CAST(NULL AS STRING) AS is_active_yn
+                FROM CLARITY_LH.CLARITY.PAT_ENC_IP_MEDS peim
+            ),
+            enc_meds AS (
+                SELECT e.*, l.src_branch, l.order_med_id, l.is_active_yn
+                FROM enc e
+                INNER JOIN med_links l ON e.pat_enc_csn_id = l.pat_enc_csn_id
+            )
+            SELECT PAT_ID, PAT_MRN_ID, APPT_PRC_ID, APPT_STATUS_C, CONTACT_DATE,
+                   ENC_CLOSE_DATE, ORDER_MED_ID, ORDERING_DATE, FREQ_NAME, SIG,
+                   HV_DISCRETE_DOSE, MIN_DISCRETE_DOSE, MAX_DISCRETE_DOSE, QUANTITY, REFILLS,
+                   START_DATE, END_DATE, NAME, PAT_ENC_CSN_ID, IS_ACTIVE_YN,
+                   CRRNT_LONG_TERM_YN, ORDER_CLASS_C, ORDERING_MODE, MEDUNIT, ORDERCLASS,
+                   MEDROUTE, THERCLASS, PHARMCLASS, PHARMSUBCLASS, GENERIC_NAME,
+                   DEPARTMENT_ID, DEPARTMENT_NAME
+            FROM (
+                SELECT /*+ BROADCAST(zoc, zmu, zar, ipf, ztc, zpc, zps, cd, zom) */ DISTINCT
+                    em.src_branch           AS SRC_BRANCH,
+                    em.pat_id               AS PAT_ID,
+                    em.pat_mrn_id           AS PAT_MRN_ID,
+                    em.appt_prc_id          AS APPT_PRC_ID,
+                    em.appt_status_c        AS APPT_STATUS_C,
+                    em.contact_date         AS CONTACT_DATE,
+                    em.enc_close_date       AS ENC_CLOSE_DATE,
+                    om.order_med_id         AS ORDER_MED_ID,
+                    om.ordering_date        AS ORDERING_DATE,
+                    ipf.freq_name           AS FREQ_NAME,
+                    om.sig                  AS SIG,
+                    om.hv_discrete_dose     AS HV_DISCRETE_DOSE,
+                    om.min_discrete_dose    AS MIN_DISCRETE_DOSE,
+                    om.max_discrete_dose    AS MAX_DISCRETE_DOSE,
+                    om.quantity             AS QUANTITY,
+                    om.refills              AS REFILLS,
+                    om.start_date           AS START_DATE,
+                    om.end_date             AS END_DATE,
+                    cm.name                 AS NAME,
+                    em.pat_enc_csn_id       AS PAT_ENC_CSN_ID,
+                    em.is_active_yn         AS IS_ACTIVE_YN,
+                    mmpl.crrnt_long_term_yn AS CRRNT_LONG_TERM_YN,
+                    om.order_class_c        AS ORDER_CLASS_C,
+                    zom.name                AS ORDERING_MODE,
+                    zmu.name                AS MEDUNIT,
+                    zoc.name                AS ORDERCLASS,
+                    zar.name                AS MEDROUTE,
+                    ztc.name                AS THERCLASS,
+                    zpc.name                AS PHARMCLASS,
+                    zps.name                AS PHARMSUBCLASS,
+                    cm.generic_name         AS GENERIC_NAME,
+                    em.department_id        AS DEPARTMENT_ID,
+                    cd.department_name      AS DEPARTMENT_NAME
+                FROM enc_meds em
+                INNER JOIN CLARITY_LH.CLARITY.ORDER_MED om              ON om.order_med_id = em.order_med_id
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_MEDICATION cm      ON om.medication_id = cm.medication_id
+                LEFT JOIN CLARITY_LH.CLARITY.MDL_MD_PRBLM_LIST mmpl     ON om.mdl_id = mmpl.med_prblm_list_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_ORDER_CLASS zoc         ON om.order_class_c = zoc.order_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_MED_UNIT zmu            ON om.hv_dose_unit_c = zmu.disp_qtyunit_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_ADMIN_ROUTE zar         ON om.med_route_c = zar.med_route_c
+                LEFT JOIN CLARITY_LH.CLARITY.IP_FREQUENCY ipf           ON om.hv_discr_freq_id = ipf.freq_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_THERA_CLASS ztc         ON cm.thera_class_c = ztc.thera_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_CLASS zpc         ON cm.pharm_class_c = zpc.pharm_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_SUBCLASS zps      ON cm.pharm_subclass_c = zps.pharm_subclass_c
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP cd             ON em.department_id = cd.department_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_ORDERING_MODE zom       ON om.ordering_mode_c = zom.ordering_mode_c
+            ) d
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID,PAT_MRN_ID,APPT_PRC_ID,APPT_STATUS_C,CONTACT_DATE,ENC_CLOSE_DATE,ORDER_MED_ID,ORDERING_DATE,FREQ_NAME,SIG,HV_DISCRETE_DOSE,MIN_DISCRETE_DOSE,MAX_DISCRETE_DOSE,QUANTITY,REFILLS,START_DATE,END_DATE,NAME,PAT_ENC_CSN_ID,IS_ACTIVE_YN,CRRNT_LONG_TERM_YN,ORDER_CLASS_C,ORDERING_MODE,MEDUNIT,ORDERCLASS,MEDROUTE,THERCLASS,PHARMCLASS,PHARMSUBCLASS,GENERIC_NAME,DEPARTMENT_ID,DEPARTMENT_NAME",
+        "identity_column": "ALLERGY_MEDS_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_OR_REPORT",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_OR_REPORT",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            WITH active_pat_ids AS (
+                SELECT PAT_ID
+                FROM (
+                    SELECT PAT_ID, IS_DELETED,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ROW_HASH
+                               ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC
+                           ) AS rn
+                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID
+                ) t
+                WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
+            ),
+            l AS (
+                SELECT ol.log_id, ol.pat_id, ol.pat_type_c, ol.surgery_date,
+                       ol.loc_id, ol.total_time_needed, ol.status_c,
+                       ol.proc_not_perf_c
+                FROM CLARITY_LH.CLARITY.OR_LOG ol
+                LEFT SEMI JOIN active_pat_ids a ON ol.pat_id = a.PAT_ID
+            ),
+            mst AS (
+                SELECT /*+ BROADCAST(loc, zp, pr, serv1, zrole, zos) */ DISTINCT
+                    l.log_id             AS LOG_ID,
+                    pat.pat_mrn_id       AS PAT_MRN_ID,
+                    pat.pat_id           AS PAT_ID,
+                    pat.pat_name         AS PAT_NAME,
+                    l.pat_type_c         AS PAT_TYPE_C,
+                    zp.name              AS PATCLASS,
+                    l.surgery_date       AS SURGERY_DATE,
+                    ser.prov_id          AS PROV_ID,
+                    ser.prov_name        AS PROV_NAME,
+                    sid.identity_id      AS ROV_IDENTITY_ID,
+                    l.loc_id             AS LOC_ID,
+                    loc.loc_name         AS LOC_NAME,
+                    proc.or_proc_id      AS OR_PROC_ID,
+                    pr.proc_name         AS PROC_NAME,
+                    l.total_time_needed  AS TOTAL_TIME_NEEDED,
+                    pr.primary_ext_id    AS PRIMARY_EXT_ID,
+                    surg.surg_id         AS SURG_ID,
+                    surg.role_c          AS ROLE_C,
+                    zrole.name           AS ROLE,
+                    serv1.name           AS SURGEONSERVICE,
+                    l.status_c           AS STATUS_C,
+                    zos.name             AS LOGSTATUS,
+                    l.proc_not_perf_c    AS PROC_NOT_PERF_C
+                FROM l
+                INNER JOIN CLARITY_LH.CLARITY.OR_LOG_ALL_PROC proc
+                    ON l.log_id = proc.log_id
+                INNER JOIN CLARITY_LH.CLARITY.OR_LOG_ALL_SURG surg
+                    ON l.log_id = surg.log_id
+                   AND surg.panel = proc.all_procs_panel
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_LOC loc
+                    ON l.loc_id = loc.loc_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_PAT_CLASS zp
+                    ON l.pat_type_c = zp.adt_pat_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER ser
+                    ON surg.surg_id = ser.prov_id
+                LEFT JOIN CLARITY_LH.CLARITY.OR_PROC pr
+                    ON proc.or_proc_id = pr.or_proc_id
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_SERVICE serv1
+                    ON surg.service_c = serv1.service_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_PANEL_ROLE zrole
+                    ON surg.role_c = zrole.role_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_STATUS zos
+                    ON l.status_c = zos.status_c
+                LEFT JOIN CLARITY_LH.CLARITY.PATIENT pat
+                    ON l.pat_id = pat.pat_id
+                LEFT JOIN CLARITY_LH.CLARITY.IDENTITY_SER_ID sid
+                    ON ser.prov_id = sid.prov_id
+                   AND sid.identity_type_id = 50
+            ),
+            cases AS (
+                SELECT c.or_case_id        AS OR_CASE_ID,
+                       ap.or_proc_id       AS OR_PROC_ID,
+                       c.setup_offset      AS SETUP_OFFSET,
+                       c.cleanup_offset    AS CLEANUP_OFFSET,
+                       ap.defaulted_length AS DEFAULTED_LENGTH,
+                       ap.total_length     AS PROC_LENGTH
+                FROM CLARITY_LH.CLARITY.OR_CASE c
+                INNER JOIN CLARITY_LH.CLARITY.OR_CASE_ALL_PROC ap
+                    ON ap.or_case_id = c.or_case_id
+            )
+            SELECT mst.LOG_ID, mst.PAT_MRN_ID, mst.PAT_ID, mst.PAT_NAME, mst.PAT_TYPE_C,
+                   mst.PATCLASS, mst.SURGERY_DATE, mst.PROV_ID, mst.PROV_NAME,
+                   mst.ROV_IDENTITY_ID, mst.LOC_ID, mst.LOC_NAME, mst.OR_PROC_ID,
+                   mst.PROC_NAME, mst.TOTAL_TIME_NEEDED, mst.PRIMARY_EXT_ID, mst.SURG_ID,
+                   mst.ROLE_C, mst.ROLE, mst.SURGEONSERVICE, mst.STATUS_C, mst.LOGSTATUS,
+                   mst.PROC_NOT_PERF_C,
+                   cases.SETUP_OFFSET, cases.CLEANUP_OFFSET, cases.DEFAULTED_LENGTH,
+                   cases.PROC_LENGTH
+            FROM mst
+            LEFT JOIN cases
+                ON mst.LOG_ID = cases.OR_CASE_ID
+               AND mst.OR_PROC_ID = cases.OR_PROC_ID
+        """,
+        "primary_keys": "",
+        "non_key_columns": "LOG_ID,PAT_MRN_ID,PAT_ID,PAT_NAME,PAT_TYPE_C,PATCLASS,SURGERY_DATE,PROV_ID,PROV_NAME,ROV_IDENTITY_ID,LOC_ID,LOC_NAME,OR_PROC_ID,PROC_NAME,TOTAL_TIME_NEEDED,PRIMARY_EXT_ID,SURG_ID,ROLE_C,ROLE,SURGEONSERVICE,STATUS_C,LOGSTATUS,PROC_NOT_PERF_C,SETUP_OFFSET,CLEANUP_OFFSET,DEFAULTED_LENGTH,PROC_LENGTH",
+        "identity_column": "ALLERGY_OR_REPORT_KEY",
+        "load_type": "FULL",
+    },
+
+    {
+        "pipeline_name": "TBL_ALLERGY_OR_SCHE",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_OR_SCHE",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT
+                pat.pat_id                       AS pat_id,
+                pat.pat_mrn_id                   AS pat_mrn_id,
+                pat.pat_name                     AS pat_name,
+                pat.birth_date                   AS birth_date,
+                NVL(zsex.name, 'Unknown')        AS sex,
+                orc.pat_age                      AS pat_age,
+                orc.pat_class_c                  AS pat_class_c,
+                zpc.name                         AS patient_class,
+                orc.or_case_id                   AS or_case_id,
+                orc.case_name                    AS case_name,
+                orc.surgery_date                 AS surgery_date,
+                orc.time_scheduled               AS time_scheduled,
+                orc.case_type_c                  AS case_type_c,
+                zorct.name                       AS case_type,
+                orc.case_class_c                 AS case_class_c,
+                zorcc.name                       AS case_class,
+                orc.service_c                    AS service_c,
+                zors.name                        AS surgery,
+                orc.exp_date                     AS exp_date,
+                orc.requested_by                 AS requested_by,
+                orc.total_time_needed            AS total_time_needed,
+                orc.referring_prov_id            AS referring_prov_id,
+                serr.prov_name                   AS referring_prov_name,
+                orc.priority_c                   AS priority_c,
+                zorp.name                        AS priority,
+                orc.sched_status_c               AS sched_status_c,
+                zorss.name                       AS sched_status,
+                orc.cancel_reason_c              AS cancel_reason_c,
+                zorcr.name                       AS cancel_reason,
+                orc.cancel_comments              AS cancel_comments,
+                orc.cancel_date                  AS cancel_date,
+                orc.admit_date                   AS admit_date,
+                orc.length_of_stay               AS length_of_stay,
+                orc.case_confirmed_yn            AS case_confirmed_yn,
+                orc.loc_id                       AS loc_id,
+                loc_name.loc_name                AS loc_name,
+                surg.surg_id                     AS surg_id,
+                serr_surg.prov_name              AS surg_name,
+                surg.role_c                      AS role_c,
+                log_sur.service_c                AS surg_svc_code,
+                zors_sur.name                    AS surg_svc_name,
+                log_sur.line                     AS surg_orlog_line
+            FROM {ACTIVE_TBL_PAT_ID} mvp
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT pat
+                ON pat.pat_id = mvp.pat_id
+            INNER JOIN CLARITY_LH.CLARITY.OR_CASE orc
+                ON orc.pat_id = pat.pat_id
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_CASE_TYPE zorct
+                ON orc.case_type_c = zorct.case_type_c
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_CASE_CLASS zorcc
+                ON orc.case_class_c = zorcc.case_class_c
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_PAT_CLASS zpc
+                ON orc.pat_class_c = zpc.adt_pat_class_c
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_SERVICE zors
+                ON orc.service_c = zors.service_c
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER serr
+                ON orc.referring_prov_id = serr.prov_id
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_PRIORITY zorp
+                ON orc.priority_c = zorp.priority_c
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_SCHED_STATUS zorss
+                ON orc.sched_status_c = zorss.sched_status_c
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_CANCEL_RSN zorcr
+                ON orc.cancel_reason_c = zorcr.cancel_reason_c
+            LEFT JOIN CLARITY_LH.CLARITY.OR_CASE_ALL_SURG surg
+                ON orc.or_case_id = surg.or_case_id
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER serr_surg
+                ON surg.surg_id = serr_surg.prov_id
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_LOC loc_name
+                ON orc.loc_id = loc_name.loc_id
+            LEFT JOIN CLARITY_LH.CLARITY.OR_LOG_ALL_SURG log_sur
+                ON orc.or_case_id = log_sur.log_id
+            LEFT JOIN CLARITY_LH.CLARITY.OR_LOG c_or_log
+                ON log_sur.log_id = c_or_log.log_id
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_OR_SERVICE zors_sur
+                ON zors_sur.service_c = log_sur.service_c
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_SEX zsex
+                ON pat.sex_c = zsex.rcpt_mem_sex_c
+            WHERE (log_sur.surg_id = serr_surg.prov_id OR log_sur.surg_id IS NULL)
+        """,
+        "primary_keys": "",
+        "non_key_columns":
+            "PAT_ID, PAT_MRN_ID, PAT_NAME, BIRTH_DATE, SEX, PAT_AGE, PAT_CLASS_C, "
+            "PATIENT_CLASS, OR_CASE_ID, CASE_NAME, SURGERY_DATE, TIME_SCHEDULED, CASE_TYPE_C, "
+            "CASE_TYPE, CASE_CLASS_C, CASE_CLASS, SERVICE_C, SURGERY, EXP_DATE, "
+            "REQUESTED_BY, TOTAL_TIME_NEEDED, REFERRING_PROV_ID, REFERRING_PROV_NAME, "
+            "PRIORITY_C, PRIORITY, SCHED_STATUS_C, SCHED_STATUS, CANCEL_REASON_C, "
+            "CANCEL_REASON, CANCEL_COMMENTS, CANCEL_DATE, ADMIT_DATE, LENGTH_OF_STAY, "
+            "CASE_CONFIRMED_YN, LOC_ID, LOC_NAME, SURG_ID, SURG_NAME, ROLE_C, "
+            "SURG_SVC_CODE, SURG_SVC_NAME, SURG_ORLOG_LINE"
+        ,
+        "identity_column": "ALLERGY_OR_SCHE_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_PFT",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PFT",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            WITH concat_values AS (
+                SELECT
+                    PAT_ID,
+                    PAT_ENC_CSN_ID,
+                    ORDER_PROC_ID,
+                    COMPONENT_ID,
+                    CONCAT_WS(
+                        ',',
+                        ARRAY_DISTINCT(
+                            TRANSFORM(
+                                SORT_ARRAY(COLLECT_LIST(STRUCT(LINE AS LINE, LTRIM(ORD_VALUE) AS ORD_VALUE))),
+                                X -> X.ORD_VALUE
+                            )
+                        )
+                    ) AS CONCAT_VALUE
+                FROM CLARITY_LH.CLARITY.ORDER_RESULTS
+                WHERE COMPONENT_ID IN (16, 17, 19, 802494, 802495, 802496, 802497)
+                GROUP BY PAT_ID, PAT_ENC_CSN_ID, ORDER_PROC_ID, COMPONENT_ID
+            ),
+            -- v2: the 7 components side by side, one row per order, so ORDER_RESULTS
+            -- is read and joined once instead of 7 times. CVnnn = the old CVnnn.CONCAT_VALUE.
+            cv AS (
+                SELECT
+                    PAT_ID,
+                    PAT_ENC_CSN_ID,
+                    ORDER_PROC_ID,
+                    MAX(CASE WHEN COMPONENT_ID = 16 THEN CONCAT_VALUE END) AS CV16,
+                    MAX(CASE WHEN COMPONENT_ID = 17 THEN CONCAT_VALUE END) AS CV17,
+                    MAX(CASE WHEN COMPONENT_ID = 19 THEN CONCAT_VALUE END) AS CV19,
+                    MAX(CASE WHEN COMPONENT_ID = 802494 THEN CONCAT_VALUE END) AS CV802494,
+                    MAX(CASE WHEN COMPONENT_ID = 802495 THEN CONCAT_VALUE END) AS CV802495,
+                    MAX(CASE WHEN COMPONENT_ID = 802496 THEN CONCAT_VALUE END) AS CV802496,
+                    MAX(CASE WHEN COMPONENT_ID = 802497 THEN CONCAT_VALUE END) AS CV802497
+                FROM concat_values
+                GROUP BY PAT_ID, PAT_ENC_CSN_ID, ORDER_PROC_ID
+            )
+            SELECT
+                PT.PAT_MRN_ID AS PAT_MRN_ID,
+                PT.PAT_NAME AS PAT_NAME,
+                OP.PAT_ID AS PAT_ID,
+                OP.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                OP.ORDER_PROC_ID AS ORDER_PROC_ID,
+                ZDET.NAME AS ENC_TYPE_TITLE,
+                R.RESULT_TIME AS RESULT_TIME,
+                R.RESULT_DATE AS RESULT_DATE,
+                R.LAB_STATUS_C AS LAB_STATUS_C,
+                R.ORD_DATE_REAL AS ORD_DATE_REAL,
+                R.ORD_END_DATE_REAL AS ORD_END_DATE_REAL,
+                DEP.DEPARTMENT_ID AS DEPARTMENT_ID,
+                DEP.DEPARTMENT_NAME AS DEPARTMENT_NAME,
+                CASE
+                    WHEN R.RESULT_STATUS_C = 2 THEN 'Preliminary'
+                    WHEN R.RESULT_STATUS_C = 3 THEN 'Final'
+                    WHEN R.RESULT_STATUS_C = 4 THEN 'Corrected'
+                    WHEN R.RESULT_STATUS_C = 5 THEN 'Incomplete'
+                    ELSE 'Unknown'
+                END AS RESULT_STATUS,
+                MAX(CASE WHEN R.COMPONENT_ID = 3 THEN R.ORD_VALUE END) AS LAST_NAME,
+                MAX(CASE WHEN R.COMPONENT_ID = 4 THEN R.ORD_VALUE END) AS FIRST_NAME,
+                MAX(CASE WHEN R.COMPONENT_ID = 5 THEN R.ORD_VALUE END) AS AGE,
+                MAX(CASE WHEN R.COMPONENT_ID = 6 THEN R.ORD_VALUE END) AS GENDER,
+                MAX(CASE WHEN R.COMPONENT_ID = 7 THEN R.ORD_VALUE END) AS RACE,
+                MAX(CASE WHEN R.COMPONENT_ID = 9 THEN R.ORD_VALUE END) AS HEIGHT,
+                MAX(CASE WHEN R.COMPONENT_ID = 10 THEN R.ORD_VALUE END) AS WEIGHT_DAILY,
+                MAX(CASE WHEN R.COMPONENT_ID = 11 THEN R.ORD_VALUE END) AS BODY_MASS_INDEX,
+                MAX(CASE WHEN R.COMPONENT_ID = 15 THEN R.ORD_VALUE END) AS TEST_DATE,
+                MAX(CV.CV16) AS PHYSICIAN,
+                MAX(CV.CV17) AS TECHNICIAN,
+                MAX(CASE WHEN R.COMPONENT_ID = 18 THEN R.ORD_VALUE END) AS DIAGNOSIS,
+                MAX(CV.CV19) AS PDF_FILE_LOCATION,
+                MAX(CASE WHEN R.COMPONENT_ID = 31 THEN R.ORD_VALUE END) AS ISOFEF_25_75_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 32 THEN R.ORD_VALUE END) AS ISOFEF_25_75_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 33 THEN R.ORD_VALUE END) AS ISOFEF_25_75_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802462 THEN R.ORD_VALUE END) AS FVC_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802463 THEN R.ORD_VALUE END) AS FVC_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802464 THEN R.ORD_VALUE END) AS FVC_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802465 THEN R.ORD_VALUE END) AS FEV1_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802466 THEN R.ORD_VALUE END) AS FEV1_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802467 THEN R.ORD_VALUE END) AS FEV1_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802468 THEN R.ORD_VALUE END) AS FEV1_FVC_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802469 THEN R.ORD_VALUE END) AS FEV1_FVC_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802470 THEN R.ORD_VALUE END) AS FEF_25_75_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802471 THEN R.ORD_VALUE END) AS FEF_25_75_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802472 THEN R.ORD_VALUE END) AS FEF_25_75_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802473 THEN R.ORD_VALUE END) AS MVV_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802474 THEN R.ORD_VALUE END) AS MVV_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802475 THEN R.ORD_VALUE END) AS PI_MAX_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802476 THEN R.ORD_VALUE END) AS PI_MAX_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802477 THEN R.ORD_VALUE END) AS PE_MAX_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802478 THEN R.ORD_VALUE END) AS PE_MAX_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802479 THEN R.ORD_VALUE END) AS TLC_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802480 THEN R.ORD_VALUE END) AS TLC_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802481 THEN R.ORD_VALUE END) AS TLC_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802482 THEN R.ORD_VALUE END) AS RV_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802483 THEN R.ORD_VALUE END) AS RV_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802484 THEN R.ORD_VALUE END) AS RV_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802485 THEN R.ORD_VALUE END) AS RV_TLC_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802486 THEN R.ORD_VALUE END) AS RV_TLC_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802487 THEN R.ORD_VALUE END) AS DLCO_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802488 THEN R.ORD_VALUE END) AS DLCO_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802489 THEN R.ORD_VALUE END) AS DLCO_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802490 THEN R.ORD_VALUE END) AS DLCO_ADJ_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802491 THEN R.ORD_VALUE END) AS DLCO_ADJ_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802492 THEN R.ORD_VALUE END) AS DLCO_ADJ_PCT_REFERENCE,
+                MAX(CV.CV802494) AS SPIRO_TECH_COMMENT,
+                MAX(CV.CV802495) AS SPIRO_INTERP,
+                MAX(CV.CV802496) AS MET_END_COMMENTS,
+                MAX(CV.CV802497) AS MET_IMPRESSION,
+                MAX(CASE WHEN R.COMPONENT_ID = 802498 THEN R.ORD_VALUE END) AS HB,
+                MAX(CASE WHEN R.COMPONENT_ID = 802501 THEN R.ORD_VALUE END) AS PEF_PRE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802502 THEN R.ORD_VALUE END) AS FVL_TIME_PRE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802503 THEN R.ORD_VALUE END) AS VC_PRE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802504 THEN R.ORD_VALUE END) AS FRC_PL_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802505 THEN R.ORD_VALUE END) AS IC_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802506 THEN R.ORD_VALUE END) AS DLCO_VA_PRE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802507 THEN R.ORD_VALUE END) AS VA_MEASURED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802508 THEN R.ORD_VALUE END) AS FVC_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802509 THEN R.ORD_VALUE END) AS FVC_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802510 THEN R.ORD_VALUE END) AS FVC_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802511 THEN R.ORD_VALUE END) AS FEV1_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802512 THEN R.ORD_VALUE END) AS FEV1_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802513 THEN R.ORD_VALUE END) AS FEV1_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802514 THEN R.ORD_VALUE END) AS FEV1_FVC_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802518 THEN R.ORD_VALUE END) AS FEF_25_75_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802519 THEN R.ORD_VALUE END) AS FEF_25_75_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802520 THEN R.ORD_VALUE END) AS FEF_25_75_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802521 THEN R.ORD_VALUE END) AS ISOFEF_25_75_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802522 THEN R.ORD_VALUE END) AS ISOFEF_25_75_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802523 THEN R.ORD_VALUE END) AS ISOFEF_25_75_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802524 THEN R.ORD_VALUE END) AS PEF_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802525 THEN R.ORD_VALUE END) AS PEF_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802526 THEN R.ORD_VALUE END) AS PEF_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802527 THEN R.ORD_VALUE END) AS PEF_PCT_PRE_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802528 THEN R.ORD_VALUE END) AS PEF_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802529 THEN R.ORD_VALUE END) AS FVL_TIME_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802530 THEN R.ORD_VALUE END) AS MVV_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802531 THEN R.ORD_VALUE END) AS MVV_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802532 THEN R.ORD_VALUE END) AS MVV_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802533 THEN R.ORD_VALUE END) AS MVV_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802534 THEN R.ORD_VALUE END) AS VC_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802536 THEN R.ORD_VALUE END) AS VC_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802539 THEN R.ORD_VALUE END) AS TLC_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802540 THEN R.ORD_VALUE END) AS TLC_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802541 THEN R.ORD_VALUE END) AS TLC_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802542 THEN R.ORD_VALUE END) AS RV_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802543 THEN R.ORD_VALUE END) AS RV_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802544 THEN R.ORD_VALUE END) AS RV_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802545 THEN R.ORD_VALUE END) AS RV_TLC_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802549 THEN R.ORD_VALUE END) AS FRC_PL_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802550 THEN R.ORD_VALUE END) AS FRC_PL_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802551 THEN R.ORD_VALUE END) AS FRC_PL_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802552 THEN R.ORD_VALUE END) AS FRC_PL_PCT_REF,
+                MAX(CASE WHEN R.COMPONENT_ID = 802553 THEN R.ORD_VALUE END) AS FRC_PL_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802554 THEN R.ORD_VALUE END) AS IC_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802555 THEN R.ORD_VALUE END) AS IC_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802556 THEN R.ORD_VALUE END) AS IC_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802557 THEN R.ORD_VALUE END) AS IC_PCT_REF,
+                MAX(CASE WHEN R.COMPONENT_ID = 802558 THEN R.ORD_VALUE END) AS IC_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802559 THEN R.ORD_VALUE END) AS DLCO_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802560 THEN R.ORD_VALUE END) AS DLCO_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802561 THEN R.ORD_VALUE END) AS DLCO_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802562 THEN R.ORD_VALUE END) AS DL_ADJ_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802563 THEN R.ORD_VALUE END) AS DL_ADJ_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802564 THEN R.ORD_VALUE END) AS DL_ADJ_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802565 THEN R.ORD_VALUE END) AS DLCO_VA_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802566 THEN R.ORD_VALUE END) AS DLCO_VA_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802567 THEN R.ORD_VALUE END) AS DLCO_VA_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802568 THEN R.ORD_VALUE END) AS DLCO_VA_PCT_PRE_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802569 THEN R.ORD_VALUE END) AS DLCO_VA_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802570 THEN R.ORD_VALUE END) AS VA_POST,
+                MAX(CASE WHEN R.COMPONENT_ID = 802571 THEN R.ORD_VALUE END) AS VA_PCT_POST_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802572 THEN R.ORD_VALUE END) AS VA_PCT_CHNG,
+                MAX(CASE WHEN R.COMPONENT_ID = 802573 THEN R.ORD_VALUE END) AS VA_PCT_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802574 THEN R.ORD_VALUE END) AS VA_REFERENCE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802578 THEN R.ORD_VALUE END) AS PI_MAX_PCT_PRE_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802582 THEN R.ORD_VALUE END) AS PE_MAX_PCT_PRE_PRED,
+                MAX(CASE WHEN R.COMPONENT_ID = 802583 THEN R.ORD_VALUE END) AS VO2_PCT_PRED_AT_BASE,
+                MAX(CASE WHEN R.COMPONENT_ID = 802586 THEN R.ORD_VALUE END) AS REE_DAY_PCT_PRED_AT_BASE
+                FROM CLARITY_LH.CLARITY.PATIENT PT
+                LEFT SEMI JOIN {ACTIVE_TBL_PAT_ID} MVP ON PT.PAT_ID = MVP.PAT_ID
+                INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE ON PE.PAT_ID = PT.PAT_ID
+                INNER JOIN CLARITY_LH.CLARITY.ORDER_PROC OP
+                    ON OP.PAT_ID = PT.PAT_ID AND OP.PAT_ENC_CSN_ID = PE.PAT_ENC_CSN_ID
+                INNER JOIN CLARITY_LH.CLARITY.ORDER_RESULTS R
+                    ON R.ORDER_PROC_ID = OP.ORDER_PROC_ID AND R.PAT_ENC_CSN_ID = OP.PAT_ENC_CSN_ID
+                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP ON DEP.DEPARTMENT_ID = PE.DEPARTMENT_ID
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_DISP_ENC_TYPE ZDET ON PE.ENC_TYPE_C = ZDET.DISP_ENC_TYPE_C
+                LEFT JOIN cv CV ON CV.PAT_ID = OP.PAT_ID AND CV.PAT_ENC_CSN_ID = OP.PAT_ENC_CSN_ID AND CV.ORDER_PROC_ID = OP.ORDER_PROC_ID
+                WHERE OP.ORDER_TYPE_C = 35
+                GROUP BY
+                    PT.PAT_MRN_ID, PT.PAT_NAME, OP.PAT_ID, OP.PAT_ENC_CSN_ID, OP.ORDER_PROC_ID,
+                    ZDET.NAME, R.RESULT_TIME, R.RESULT_DATE, R.LAB_STATUS_C, R.ORD_DATE_REAL,
+                    R.ORD_END_DATE_REAL, DEP.DEPARTMENT_ID, DEP.DEPARTMENT_NAME, R.RESULT_STATUS_C
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID, PAT_ENC_CSN_ID, ORDER_PROC_ID, PAT_MRN_ID, PAT_NAME, ENC_TYPE_TITLE, RESULT_TIME, RESULT_DATE, LAB_STATUS_C, ORD_DATE_REAL, ORD_END_DATE_REAL, DEPARTMENT_ID, DEPARTMENT_NAME, RESULT_STATUS, LAST_NAME, FIRST_NAME, AGE, GENDER, RACE, HEIGHT, WEIGHT_DAILY, BODY_MASS_INDEX, TEST_DATE, PHYSICIAN, TECHNICIAN, DIAGNOSIS, PDF_FILE_LOCATION, ISOFEF_25_75_REFERENCE, ISOFEF_25_75_MEASURED, ISOFEF_25_75_PCT_REFERENCE, FVC_REFERENCE, FVC_MEASURED, FVC_PCT_REFERENCE, FEV1_REFERENCE, FEV1_MEASURED, FEV1_PCT_REFERENCE, FEV1_FVC_REFERENCE, FEV1_FVC_MEASURED, FEF_25_75_REFERENCE, FEF_25_75_MEASURED, FEF_25_75_PCT_REFERENCE, MVV_REFERENCE, MVV_MEASURED, PI_MAX_REFERENCE, PI_MAX_MEASURED, PE_MAX_REFERENCE, PE_MAX_MEASURED, TLC_REFERENCE, TLC_MEASURED, TLC_PCT_REFERENCE, RV_REFERENCE, RV_MEASURED, RV_PCT_REFERENCE, RV_TLC_REFERENCE, RV_TLC_MEASURED, DLCO_REFERENCE, DLCO_MEASURED, DLCO_PCT_REFERENCE, DLCO_ADJ_REFERENCE, DLCO_ADJ_MEASURED, DLCO_ADJ_PCT_REFERENCE, SPIRO_TECH_COMMENT, SPIRO_INTERP, MET_END_COMMENTS, MET_IMPRESSION, HB, PEF_PRE, FVL_TIME_PRE, VC_PRE, FRC_PL_MEASURED, IC_MEASURED, DLCO_VA_PRE, VA_MEASURED, FVC_POST, FVC_PCT_POST_PRED, FVC_PCT_CHNG, FEV1_POST, FEV1_PCT_POST_PRED, FEV1_PCT_CHNG, FEV1_FVC_POST, FEF_25_75_POST, FEF_25_75_PCT_POST_PRED, FEF_25_75_PCT_CHNG, ISOFEF_25_75_POST, ISOFEF_25_75_PCT_POST_PRED, ISOFEF_25_75_PCT_CHNG, PEF_POST, PEF_PCT_POST_PRED, PEF_PCT_CHNG, PEF_PCT_PRE_PRED, PEF_PRED, FVL_TIME_POST, MVV_POST, MVV_PCT_POST_PRED, MVV_PCT_CHNG, MVV_PCT_REFERENCE, VC_POST, VC_PCT_CHNG, TLC_POST, TLC_PCT_POST_PRED, TLC_PCT_CHNG, RV_POST, RV_PCT_POST_PRED, RV_PCT_CHNG, RV_TLC_POST, FRC_PL_POST, FRC_PL_PCT_POST_PRED, FRC_PL_PCT_CHNG, FRC_PL_PCT_REF, FRC_PL_REFERENCE, IC_POST, IC_PCT_POST_PRED, IC_PCT_CHNG, IC_PCT_REF, IC_REFERENCE, DLCO_POST, DLCO_PCT_POST_PRED, DLCO_PCT_CHNG, DL_ADJ_POST, DL_ADJ_PCT_POST_PRED, DL_ADJ_PCT_CHNG, DLCO_VA_POST, DLCO_VA_PCT_POST_PRED, DLCO_VA_PCT_CHNG, DLCO_VA_PCT_PRE_PRED, DLCO_VA_PRED, VA_POST, VA_PCT_POST_PRED, VA_PCT_CHNG, VA_PCT_REFERENCE, VA_REFERENCE, PI_MAX_PCT_PRE_PRED, PE_MAX_PCT_PRE_PRED, VO2_PCT_PRED_AT_BASE, REE_DAY_PCT_PRED_AT_BASE",
+        "identity_column": "ALLERGY_PFT_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_PROBLEM_LIST",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PROBLEM_LIST",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+
+        "source_query": f"""
+            SELECT DISTINCT
+                PT.PAT_MRN_ID         AS PAT_MRN_ID,
+                PT.PAT_ID             AS PAT_ID,
+                G.DX_NAME             AS DX_NAME,
+                L.DESCRIPTION         AS PROBLISTDESC,
+                G.CURRENT_ICD9_LIST   AS ICD9_CODE,
+                G.CURRENT_ICD10_LIST  AS ICD10_CODE,
+                G.DX_GROUP            AS DX_GROUP,
+                L.NOTED_DATE          AS NOTED_DATE,
+                L.RESOLVED_DATE       AS RESOLVED_DATE,
+                L.DATE_OF_ENTRY       AS DATE_OF_ENTRY,
+                ZPS.NAME              AS STATUS,
+                ZCOP.NAME             AS CLASS_OF_PROBLEM,
+                L.CHRONIC_YN          AS CHRONIC_YN,
+                ZP.NAME               AS PRIORITY,
+                L.PROBLEM_CMT         AS PROBLEM_COMMENT,
+                L.PRINCIPAL_PL_YN     AS PRINCIPAL_PL_YN,
+                L.HOSPITAL_PL_YN      AS HOSPITAL_PL_YN,
+                L.SHOW_IN_MYC_YN      AS SHOW_IN_MYC_YN
+            FROM {ACTIVE_TBL_PAT_ID} MVP
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PT
+                ON PT.PAT_ID = MVP.PAT_ID
+            INNER JOIN CLARITY_LH.CLARITY.PROBLEM_LIST L
+                ON L.PAT_ID = PT.PAT_ID
+            LEFT JOIN CLARITY_LH.CLARITY.CLARITY_EDG G
+                ON G.DX_ID = L.DX_ID
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_PROBLEM_STATUS ZPS
+                ON L.PROBLEM_STATUS_C = ZPS.PROBLEM_STATUS_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_CLASS_OF_PROBLE ZCOP
+                ON L.CLASS_OF_PROBLEM_C = ZCOP.CLASS_OF_PROBLEM_C
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_PRIORITY_3 ZP
+                ON L.PRIORITY_C = ZP.PRIORITY_3_C
+        """,
+
+        "primary_keys": "",
+        "non_key_columns": (
+            "PAT_MRN_ID, PAT_ID, DX_NAME, PROBLISTDESC, ICD9_CODE, "
+            "ICD10_CODE, DX_GROUP, NOTED_DATE, RESOLVED_DATE, "
+            "DATE_OF_ENTRY, STATUS, CLASS_OF_PROBLEM, CHRONIC_YN, "
+            "PRIORITY, PROBLEM_COMMENT, PRINCIPAL_PL_YN, "
+            "HOSPITAL_PL_YN, SHOW_IN_MYC_YN"
+        ),
+        "identity_column": "ALLERGY_PROBLEM_LIST_KEY",
+        "load_type": "FULL",
+    },
+
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_PTT_MEDHX",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PTT_MEDHX",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+
+        "source_query": f"""
+            SELECT DISTINCT
+                PAT.PAT_MRN_ID                              AS PAT_MRN_ID,
+                PAT.PAT_ID                                  AS PAT_ID,
+                PAT.PAT_NAME                                AS PAT_NAME,
+                HX.LINE                                     AS LINE,
+                HX.CONTACT_DATE                             AS HX_CONTACT_DATE,
+                HX.DX_ID                                    AS DX_ID,
+                G.DX_NAME                                   AS DX_NAME,
+                G.CURRENT_ICD9_LIST                         AS ICD9_CODE,
+                HX.MEDICAL_HX_DATE                          AS MEDICAL_HX_DATE,
+                HX.COMMENTS                                 AS COMMENTS,
+                ZH.NAME                                     AS HISTORYSOURCE_1,
+                CAST(NULL AS STRING)                        AS HISTORYSOURCE_2,
+                CAST(HX.MED_HX_ANNOTATION AS STRING)        AS MED_HX_ANNOTATION,
+                HX.HX_LNK_ENC_CSN                           AS HX_LNK_ENC_CSN,
+                E.PAT_ENC_CSN_ID                            AS PAT_ENC_CSN_ID,
+                HX.ENC_ICD_CODE                             AS ENC_ICD_CODE,
+                E.DEPARTMENT_ID                             AS DEPARTMENT_ID,
+                DEP.DEPARTMENT_NAME                         AS DEPARTMENT_NAME
+            FROM CLARITY_LH.CLARITY.MEDICAL_HX HX
+            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC E
+                ON HX.HX_LNK_ENC_CSN = E.PAT_ENC_CSN_ID
+            INNER JOIN CLARITY_LH.CLARITY.PATIENT PAT
+                ON PAT.PAT_ID = E.PAT_ID
+            INNER JOIN {ACTIVE_TBL_PAT_ID} MVP
+                ON MVP.PAT_ID = E.PAT_ID
+            LEFT OUTER JOIN CLARITY_LH.CLARITY.CLARITY_EDG G
+                ON G.DX_ID = HX.DX_ID
+            LEFT OUTER JOIN CLARITY_LH.CLARITY.ZC_HISTORY_SOURCE ZH
+                ON ZH.HISTORY_SOURCE_C = HX.MED_HX_SOURCE_C
+            LEFT OUTER JOIN CLARITY_LH.CLARITY.CLARITY_DEP DEP
+                ON DEP.DEPARTMENT_ID = E.DEPARTMENT_ID
+        """,
+
+
+        "primary_keys": "",
+
+        "non_key_columns": (
+            "PAT_MRN_ID, PAT_ID, PAT_NAME, LINE, HX_CONTACT_DATE, "
+            "DX_ID, DX_NAME, ICD9_CODE, MEDICAL_HX_DATE, COMMENTS, "
+            "HISTORYSOURCE_1, HISTORYSOURCE_2, MED_HX_ANNOTATION, "
+            "HX_LNK_ENC_CSN, PAT_ENC_CSN_ID, ENC_ICD_CODE, "
+            "DEPARTMENT_ID, DEPARTMENT_NAME"
+        ),
+
+        "identity_column": "ALLERGY_PTT_MEDHX_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_SKINTEST",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_SKINTEST",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": """
+            WITH latest_form_date AS (
+                SELECT form_id, MAX(contact_date_real) AS max_contact_date_real
+                FROM CLARITY_LH.CLARITY.SMARTFORM_CONCEPT
+                WHERE form_id IN ('7','8','9','10','11','12','13','6','110')
+                GROUP BY form_id
+            ),
+            filtered_concepts AS (
+                SELECT sc.form_id, sc.concept_id
+                FROM CLARITY_LH.CLARITY.SMARTFORM_CONCEPT sc
+                INNER JOIN latest_form_date lfd
+                    ON sc.form_id = lfd.form_id
+                    AND sc.contact_date_real = lfd.max_contact_date_real
+                INNER JOIN CLARITY_LH.CLARITY.CLARITY_CONCEPT cc
+                    ON sc.concept_id = cc.concept_id
+                    AND cc.concept_id LIKE '%AMB%'
+                WHERE sc.form_id IN ('7','8','9','10','11','12','13','6','110')
+            ),
+            -- ---- pruning only: these CTEs just pre-filter the big tables to rows that
+            -- ---- the original joins would keep anyway (semi join = inner join filter)
+            concept_ids AS (
+                SELECT DISTINCT concept_id FROM filtered_concepts
+            ),
+            nc_f AS (
+                SELECT /*+ BROADCAST(c) */ nc.*
+                FROM CLARITY_LH.CLARITY.NOTE_CONCEPT nc
+                LEFT SEMI JOIN concept_ids c
+                    ON nc.concept_id = c.concept_id
+            ),
+            note_ids AS (
+                SELECT DISTINCT hno_id AS note_id FROM nc_f
+            ),
+            eni_f AS (
+                SELECT eni.*
+                FROM CLARITY_LH.CLARITY.NOTE_ENC_INFO eni
+                LEFT SEMI JOIN note_ids n
+                    ON eni.note_id = n.note_id
+            ),
+            hn_f AS (
+                SELECT hn.*
+                FROM CLARITY_LH.CLARITY.HNO_INFO hn
+                LEFT SEMI JOIN note_ids n
+                    ON hn.note_id = n.note_id
+            ),
+            csn_ids AS (
+                SELECT DISTINCT pat_enc_csn_id FROM hn_f
+            ),
+            pe_f AS (
+                SELECT pe.*
+                FROM CLARITY_LH.CLARITY.PAT_ENC pe
+                LEFT SEMI JOIN csn_ids c
+                    ON pe.pat_enc_csn_id = c.pat_enc_csn_id
+            )
+            SELECT /*+ BROADCAST(fc, cq, dep) */ DISTINCT
+                pat.pat_id               AS pat_id,
+                pe.pat_enc_csn_id        AS pat_enc_csn_id,
+                cq.form_name             AS form_name,
+                cq.form_id               AS form_id,
+                cc.name                  AS concept_name,
+                cc.abbreviation          AS abbreviation,
+                nc.concept_value         AS concept_value,
+                cc.concept_id            AS concept_id,
+                nc.concept_source        AS concept_source,
+                dep.department_id        AS department_id,
+                dep.department_name      AS department_name,
+                eni.note_id              AS note_encounter_note_id,
+                eni.author_user_id       AS note_author_id,
+                emp.name                 AS note_author_name,
+                eni.entry_instant_dttm   AS note_created
+            FROM CLARITY_LH.CLARITY.PATIENT AS pat
+            INNER JOIN pe_f AS pe
+                ON pe.pat_id = pat.pat_id
+            INNER JOIN hn_f AS hn
+                ON pe.pat_enc_csn_id = hn.pat_enc_csn_id
+            INNER JOIN eni_f AS eni
+                ON hn.note_id = eni.note_id
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_DEP AS dep
+                ON pe.department_id = dep.department_id
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_EMP AS emp
+                ON eni.author_user_id = emp.user_id
+            INNER JOIN nc_f AS nc
+                ON nc.hno_id = eni.note_id
+            INNER JOIN filtered_concepts AS fc
+                ON nc.concept_id = fc.concept_id
+            INNER JOIN CLARITY_LH.CLARITY.CLARITY_CONCEPT AS cc
+                ON cc.concept_id = fc.concept_id
+            INNER JOIN CLARITY_LH.CLARITY.CL_QFORM AS cq
+                ON fc.form_id = cq.form_id
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID,PAT_ENC_CSN_ID,FORM_NAME,FORM_ID,CONCEPT_NAME,ABBREVIATION,CONCEPT_VALUE,CONCEPT_ID,CONCEPT_SOURCE,DEPARTMENT_ID,DEPARTMENT_NAME,NOTE_ENCOUNTER_NOTE_ID,NOTE_AUTHOR_ID,NOTE_AUTHOR_NAME,NOTE_CREATED",
+        "identity_column": "ALLERGY_SKINTEST_KEY",
+        "load_type": "FULL",
+    },
+
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_VISITS",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_VISITS",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+
+        WITH flowsheet_active AS (
+            SELECT *
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (PARTITION BY row_hash ORDER BY dw_updated_at DESC) AS rn
+                FROM ALLERGY_LH.ALLERGY_DELTA.TBL_VISITS_FLOWSHEET_MEASURE
+            )
+            WHERE rn = 1 AND is_deleted = 0
+        )
+        SELECT
+            pt.pat_mrn_id AS pat_mrn_id,
+            pt.pat_name AS pat_name,
+            pt.pat_first_name AS pat_first_name,
+            pt.pat_last_name AS pat_last_name,
+            pt.pat_middle_name AS pat_middle_name,
+            pt.pat_id AS pat_id,
+            en.pat_enc_csn_id AS pat_enc_csn_id,
+            en.contact_date AS contact_date,
+            en.enc_close_date AS enc_close_date,
+            pcp.prov_id AS pcp_provider_id,
+            pcp.prov_name AS pcp_provider,
+            vst.prov_id AS visit_provider_id,
+            vst.prov_name AS visit_provider,
+            prc.prc_name AS prc_name,
+            zdet.name AS enc_type_title,
+            ROUND ( ( CAST (SUBSTR (en.height, 1, INSTR (en.height, "'") - 1) AS DOUBLE) * 30.48), 4)
+          + ROUND ( ( CAST (SUBSTR (en.height, INSTR (en.height, "'") + 1,
+                        (INSTR (en.height, '"') - INSTR (en.height, "'")) - 1) AS DOUBLE) * 2.54), 4)
+              AS height_in_cms,
+            en.height AS height,
+            hgt.percentile_value AS ht_age_perc,
+            wgt.percentile_value AS wt_age_perc,
+            bmi.percentile_value AS bmi_age_perc,
+            len.percentile_value AS wt_length_perc,
+            ROUND ( (CAST (en.weight AS DOUBLE) * 0.02835), 4) AS weight_in_kgs,
+            en.weight AS weight,
+            en.bmi AS bmi,
+            en.bp_systolic AS bp_systolic,
+            en.bp_diastolic AS bp_diastolic,
+            en.temperature AS temperature,
+            en.pulse AS pulse,
+            en.respirations AS respirations,
+            en.department_id AS deparment_id,
+            dep.department_name AS department_name,
+            en.checkin_time AS checkin_time,
+            en.appt_made_date AS appt_made_date,
+            en.appt_time AS appt_time,
+            en.arvl_lst_dl_time AS remove_arrival_time,
+            en.los_proc_code AS los_proc_code,
+            eap.proc_name AS los_proc_name,
+            en.los_prime_proc_id AS los_prime_proc_id,
+            en.hosp_admsn_time AS hosp_admsn_time,
+            en.hosp_dischrg_time AS hosp_dischrg_time
+        FROM {ACTIVE_TBL_PAT_ID} mvp
+        JOIN CLARITY_LH.CLARITY.PATIENT pt
+          ON pt.pat_id = mvp.pat_id
+        JOIN CLARITY_LH.CLARITY.PAT_ENC en
+          ON en.pat_id = pt.pat_id
+        LEFT JOIN CLARITY_LH.CLARITY.CLARITY_PRC prc
+          ON en.appt_prc_id = prc.prc_id
+        LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP dep
+          ON en.department_id = dep.department_id
+        LEFT JOIN CLARITY_LH.CLARITY.CLARITY_EAP eap
+          ON en.los_prime_proc_id = eap.proc_id
+        LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER pcp
+          ON pt.cur_pcp_prov_id = pcp.prov_id
+        LEFT JOIN CLARITY_LH.CLARITY.CLARITY_SER vst
+          ON en.visit_prov_id = vst.prov_id
+        LEFT JOIN CLARITY_LH.CLARITY.ZC_DISP_ENC_TYPE zdet
+          ON en.enc_type_c = zdet.disp_enc_type_c
+        -- Weight
+        LEFT JOIN flowsheet_active wgt
+          ON en.pat_enc_csn_id = wgt.pat_enc_csn_id
+         AND en.pat_id = wgt.pat_id
+         AND wgt.template_id = '103'
+         AND wgt.row_meas_id = '3478'
+        -- Height
+        LEFT JOIN flowsheet_active hgt
+          ON en.pat_enc_csn_id = hgt.pat_enc_csn_id
+         AND en.pat_id = hgt.pat_id
+         AND hgt.template_id = '103'
+         AND hgt.row_meas_id = '3480'
+        -- BMI
+        LEFT JOIN flowsheet_active bmi
+          ON en.pat_enc_csn_id = bmi.pat_enc_csn_id
+         AND en.pat_id = bmi.pat_id
+         AND bmi.template_id = '103'
+         AND bmi.row_meas_id = '3481'
+        -- Length
+        LEFT JOIN flowsheet_active len
+          ON en.pat_enc_csn_id = len.pat_enc_csn_id
+         AND en.pat_id = len.pat_id
+         AND len.template_id = '103'
+         AND len.row_meas_id = '3488'
+
+        """,
+        "primary_keys": "",
+        "non_key_columns": "PAT_ID, PAT_ENC_CSN_ID, PAT_MRN_ID, PAT_NAME, PAT_FIRST_NAME, PAT_LAST_NAME, PAT_MIDDLE_NAME, "
+                           "CONTACT_DATE, ENC_CLOSE_DATE, PCP_PROVIDER_ID, PCP_PROVIDER, "
+                           "VISIT_PROVIDER_ID, VISIT_PROVIDER, PRC_NAME, ENC_TYPE_TITLE, "
+                           "HEIGHT_IN_CMS, HEIGHT, HT_AGE_PERC, WT_AGE_PERC, BMI_AGE_PERC, "
+                           "WT_LENGTH_PERC, WEIGHT_IN_KGS, WEIGHT, BMI, BP_SYSTOLIC, BP_DIASTOLIC, "
+                           "TEMPERATURE, PULSE, RESPIRATIONS, DEPARMENT_ID, DEPARTMENT_NAME, "
+                           "CHECKIN_TIME, APPT_MADE_DATE, APPT_TIME, REMOVE_ARRIVAL_TIME, "
+                           "LOS_PROC_CODE, LOS_PROC_NAME, LOS_PRIME_PROC_ID, HOSP_ADMSN_TIME, "
+                           "HOSP_DISCHRG_TIME",
+        "identity_column": "ALLERGY_VISITS_KEY",
+        "load_type": "FULL",
+    },
+
+
+
+    {
+        "pipeline_name": "TBL_ALLERGY_NOTES_C",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_NOTES_C",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": r"""
+            WITH cced AS (
+                SELECT PAT_ENC_CSN_ID
+                FROM (
+                    SELECT PAT_ENC_CSN_ID, IS_DELETED,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ROW_HASH
+                               ORDER BY DW_UPDATED_AT DESC, BATCH_ID DESC
+                           ) AS rn
+                    FROM ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC
+                ) t
+                WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
+            ),
+            notes AS (
+                SELECT /*+ BROADCAST(nti) */
+                    hno.PAT_ENC_CSN_ID,
+                    hno.IP_NOTE_TYPE_C,
+                    nti.NAME AS IP_NOTE_TYPE,
+                    hno.CM_PHY_OWNER_ID,
+                    hno.CM_LOG_OWNER_ID,
+                    hno.NOTE_DESC,
+                    hno.NOTE_ID
+                FROM cced
+                INNER JOIN CLARITY_LH.CLARITY.HNO_INFO hno
+                    ON cced.PAT_ENC_CSN_ID = hno.PAT_ENC_CSN_ID
+                   AND (hno.DELETE_USER_ID IS NULL OR hno.DELETE_INSTANT_DTTM IS NULL)
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_TYPE_IP nti
+                    ON hno.IP_NOTE_TYPE_C = nti.TYPE_IP_C
+            ),
+            note_ids AS (
+                SELECT DISTINCT NOTE_ID FROM notes
+            ),
+            nei AS (
+                SELECT /*+ BROADCAST(ztt, ztas, zss, znf, ns) */
+                    e.NOTE_ID,
+                    e.CONTACT_SERIAL_NUM,
+                    e.AUTHOR_USER_ID          AS NOTE_AUTHOR_USR_ID,
+                    e.UPDATE_USER_ID          AS NOTE_EDITOR_USR_ID,
+                    e.UPD_AUTHOR_INS_DTTM     AS EDIT_INST,
+                    e.NOTE_FILE_TIME_DTTM     AS FILING_DATE,
+                    e.NOTE_STATUS_C           AS NOTE_STAT_C,
+                    ns.NAME                   AS NOTE_STATUS,
+                    ztt.NAME                  AS TRANSCRIPTION_TYPE,
+                    e.TRN_DOC_AVAIL_STA_C,
+                    ztas.NAME                 AS TRANSCRIPTION_STATUS,
+                    e.SENSITIVE_STAT_C,
+                    zss.NAME                  AS SENSITIVE_STAT,
+                    e.NOTE_FORMAT_C,
+                    znf.NAME                  AS NOTE_FORMAT,
+                    e.SPEC_NOTE_TIME_DTTM     AS SPECIFIED_DATETIME
+                FROM (
+                    SELECT *
+                    FROM CLARITY_LH.CLARITY.NOTE_ENC_INFO x
+                    LEFT SEMI JOIN note_ids n ON x.NOTE_ID = n.NOTE_ID
+                ) e
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_TRANS_TYPE ztt
+                    ON e.TRN_DOC_TYPE_C = ztt.TRANS_TYPE_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_TRANS_AVAIL_STS ztas
+                    ON e.TRN_DOC_AVAIL_STA_C = ztas.TRANS_AVAIL_STS_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_SENSITIVE_ST zss
+                    ON e.SENSITIVE_STAT_C = zss.SENSITIVE_ST_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_FORMAT znf
+                    ON e.NOTE_FORMAT_C = znf.NOTE_FORMAT_C
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_NOTE_STATUS ns
+                    ON e.NOTE_STATUS_C = ns.NOTE_STATUS_C
+            ),
+            hnt AS (
+                SELECT h.NOTE_ID, h.NOTE_CSN_ID, h.CONTACT_DATE_REAL, h.LINE, h.NOTE_TEXT
+                FROM CLARITY_LH.CLARITY.HNO_NOTE_TEXT h
+                LEFT SEMI JOIN note_ids n ON h.NOTE_ID = n.NOTE_ID
+                WHERE length(trim(h.NOTE_TEXT)) > 0
+            ),
+            note_data AS (
+                SELECT
+                    notes.PAT_ENC_CSN_ID,
+                    notes.IP_NOTE_TYPE_C,
+                    notes.IP_NOTE_TYPE,
+                    notes.CM_PHY_OWNER_ID,
+                    notes.CM_LOG_OWNER_ID,
+                    notes.NOTE_DESC,
+                    notes.NOTE_ID,
+                    hnt.NOTE_CSN_ID,
+                    hnt.CONTACT_DATE_REAL,
+                    nei.NOTE_AUTHOR_USR_ID,
+                    nei.NOTE_EDITOR_USR_ID,
+                    nei.EDIT_INST,
+                    nei.FILING_DATE,
+                    nei.NOTE_STAT_C,
+                    nei.NOTE_STATUS,
+                    nei.TRANSCRIPTION_TYPE,
+                    nei.TRN_DOC_AVAIL_STA_C,
+                    nei.TRANSCRIPTION_STATUS,
+                    CAST(NULL AS STRING) AS TRN_DOC_DESCENDANTS,
+                    nei.SENSITIVE_STAT_C,
+                    nei.SENSITIVE_STAT,
+                    nei.NOTE_FORMAT_C,
+                    nei.NOTE_FORMAT,
+                    nei.SPECIFIED_DATETIME,
+                    hnt.LINE,
+                    hnt.NOTE_TEXT,
+                    RANK() OVER (
+                        PARTITION BY notes.NOTE_ID
+                        ORDER BY hnt.CONTACT_DATE_REAL DESC NULLS FIRST
+                    ) AS RN
+                FROM notes
+                INNER JOIN nei
+                    ON notes.NOTE_ID = nei.NOTE_ID
+                INNER JOIN hnt
+                    ON nei.NOTE_ID = hnt.NOTE_ID
+                   AND nei.CONTACT_SERIAL_NUM = hnt.NOTE_CSN_ID
+            ),
+            latest AS (
+                -- Keep only most recent per NOTE_ID; build each XMLELEMENT(e, ...) piece
+                SELECT
+                    d.*,
+                    concat(
+                        '<E>',
+                        replace(replace(replace(replace(replace(
+                            regexp_replace(upper(trim(d.NOTE_TEXT)), '[\\p{Cc}]', ''),
+                            '&', '&amp;'), '<', '&lt;'), '>', '&gt;'),
+                            '"', '&quot;'), "'", '&apos;'),
+                        char(13),
+                        '</E>'
+                    ) AS XML_PIECE
+                FROM note_data d
+                WHERE d.RN = 1
+            )
+            SELECT
+                PAT_ENC_CSN_ID,
+                IP_NOTE_TYPE_C,
+                IP_NOTE_TYPE,
+                CM_PHY_OWNER_ID,
+                CM_LOG_OWNER_ID,
+                NOTE_DESC,
+                NOTE_ID,
+                NOTE_CSN_ID,
+                CONTACT_DATE_REAL,
+                NOTE_AUTHOR_USR_ID,
+                NOTE_EDITOR_USR_ID,
+                EDIT_INST,
+                FILING_DATE,
+                NOTE_STAT_C,
+                NOTE_STATUS,
+                TRANSCRIPTION_TYPE,
+                TRN_DOC_AVAIL_STA_C,
+                TRANSCRIPTION_STATUS,
+                TRN_DOC_DESCENDANTS,
+                SENSITIVE_STAT_C,
+                SENSITIVE_STAT,
+                NOTE_FORMAT_C,
+                NOTE_FORMAT,
+                SPECIFIED_DATETIME,
+                array_join(
+                    transform(
+                        array_sort(collect_list(named_struct('line', LINE, 'txt', XML_PIECE))),
+                        x -> x.txt
+                    ),
+                    ''
+                ) AS NOTE_TEXT
+            FROM latest
+            GROUP BY
+                PAT_ENC_CSN_ID,
+                IP_NOTE_TYPE_C,
+                IP_NOTE_TYPE,
+                CM_PHY_OWNER_ID,
+                CM_LOG_OWNER_ID,
+                NOTE_DESC,
+                NOTE_ID,
+                NOTE_CSN_ID,
+                CONTACT_DATE_REAL,
+                NOTE_AUTHOR_USR_ID,
+                NOTE_EDITOR_USR_ID,
+                EDIT_INST,
+                FILING_DATE,
+                NOTE_STAT_C,
+                NOTE_STATUS,
+                TRANSCRIPTION_TYPE,
+                TRN_DOC_AVAIL_STA_C,
+                TRANSCRIPTION_STATUS,
+                TRN_DOC_DESCENDANTS,
+                SENSITIVE_STAT_C,
+                SENSITIVE_STAT,
+                NOTE_FORMAT_C,
+                NOTE_FORMAT,
+                SPECIFIED_DATETIME
+        """,
+
+        "primary_keys": "",
+        "non_key_columns": "PAT_ENC_CSN_ID,IP_NOTE_TYPE_C,IP_NOTE_TYPE,CM_PHY_OWNER_ID,CM_LOG_OWNER_ID,NOTE_DESC,NOTE_ID,NOTE_CSN_ID,CONTACT_DATE_REAL,NOTE_AUTHOR_USR_ID,NOTE_EDITOR_USR_ID,EDIT_INST,FILING_DATE,NOTE_STAT_C,NOTE_STATUS,TRANSCRIPTION_TYPE,TRN_DOC_AVAIL_STA_C,TRANSCRIPTION_STATUS,TRN_DOC_DESCENDANTS,SENSITIVE_STAT_C,SENSITIVE_STAT,NOTE_FORMAT_C,NOTE_FORMAT,SPECIFIED_DATETIME,NOTE_TEXT",
+        "identity_column": "ALLERGY_NOTES_C_KEY",
+        "load_type": "FULL",
+    },
+
+
+    {
+        "pipeline_name": "TBL_MRN_HIST",
+        "target_table": "ALLERGY_LH.ALLERGY_DELTA.TBL_MRN_HIST",
+        "batch_table": "ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES",
+        "source_query": f"""
+            SELECT
+                id_hist.PAT_ID,
+                id_hist.LINE,
+                id_hist.OLD_PAT_ID,
+                id_hist.ID_HX,
+                id_hist.IDENTITY_NEW_ID,
+                ct.NAME AS CHANGE_TYPE,
+                id_hist.ID_CHG_DATE
+
+            FROM CLARITY_LH.CLARITY.IDENTITY_ID_HX id_hist
+
+            INNER JOIN {ACTIVE_TBL_PAT_ID} mv
+                ON mv.PAT_ID = id_hist.PAT_ID
+
+            LEFT JOIN CLARITY_LH.CLARITY.ZC_ID_CHG_TYPE ct
+                ON ct.ID_CHG_TYPE_C = id_hist.ID_CHG_TYPE_C
+        """,
+        "primary_keys": "PAT_ID,LINE",
+        "non_key_columns": "OLD_PAT_ID,ID_HX,IDENTITY_NEW_ID,CHANGE_TYPE,ID_CHG_DATE",
+        "identity_column": "MRN_HIST_KEY",
+        "load_type": "FULL",
+    }
+
+]
