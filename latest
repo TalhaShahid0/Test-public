@@ -1,5 +1,34 @@
 # ============================================================
-# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v4
+# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v5
+#
+# v5 = v4 + two fixes from the 2026-11-09 run (7h36m wall clock for about
+# 3.5h of pipeline work: TBL_ALLERGY_NOTES_C ran 2h50m in an older session
+# until the 4h kill, and took 49 min in a fresh one). Same order, same
+# results, same logs.
+#
+#   I. WATCHDOG IN SEQUENTIAL MODE TOO (watchdog=True, default). Each
+#      pipeline runs in a worker thread and the notebook thread watches it.
+#      The round stops cleanly (STATUS 'STOPPED_TIME_LIMIT', RUN_NOTE
+#      'STALL: <name>' or 'OVERRUN: <name>') when the running pipeline
+#        - has had no Spark job for stall_minutes (20), or
+#        - its attempt runs longer than
+#          max(overrun_factor (2) x expected, expected + overrun_min_minutes (30)).
+#          Only for a pipeline with run history, and never for the first
+#          pipeline of a fresh session (a new session cannot do better).
+#      Its Spark jobs are cancelled, a thread dump is printed, and the next
+#      round of the Until loop (fresh session) starts with that pipeline. A
+#      pipeline stopped by the watchdog runs WITHOUT the watchdog for the
+#      rest of that resume chain, so a genuinely slow day cannot loop.
+#      watchdog=False (and max_parallel=1) = exactly the v4 sequential loop.
+#   J. EXPECTED TIME from the last duration_history (3, was 5) successful
+#      runs. A session-killed batch counts only if the pipeline has not
+#      succeeded since (a kill caused by a hang no longer blocks it for the
+#      next 5 runs).
+#   K. A storage "server busy" error (503 ServerBusy / 429, e.g. the MEDS
+#      failure of 2026-11-09) waits busy_retry_wait_seconds (180) before the
+#      retry instead of 15 s.
+#
+# ---- v4 notes ----
 #
 # v4 = v3 + speed options. With the defaults (max_parallel=1) it runs
 # exactly like v3: same order, same time box, same resume, same logs.
@@ -406,11 +435,13 @@ def _already_done_pipelines(resume_gap_minutes, resume_window_hours,
     return done, chain
 
 
-def _recent_durations(names, batch_tables, history=5):
+def _recent_durations(names, batch_tables, history=3):
     """Longest recent run time (seconds) per pipeline, from:
       - its last `history` SUCCESS attempts in ATTEMPT_TABLE,
-      - its last `history` SUCCESS or session-killed batches in the batch
-        tables (a killed batch counts with the time it had run when killed).
+      - its last `history` SUCCESS batches in the batch tables, and its
+        session-killed batches that came AFTER its latest SUCCESS batch (a
+        killed batch counts with the time it had run when killed; once the
+        pipeline has succeeded again it no longer counts).
     Pipelines with no history are missing from the result."""
     names = list(names)
     out = {}
@@ -436,7 +467,7 @@ def _recent_durations(names, batch_tables, history=5):
     for bt in batch_tables:
         if not spark.catalog.tableExists(bt):
             continue
-        take(
+        rows = (
             spark.table(bt)
             .filter(
                 col("PIPELINE_NAME").isin(names)
@@ -447,6 +478,21 @@ def _recent_durations(names, batch_tables, history=5):
                     | ((col("STATUS") == "FAILED")
                        & col("ERROR_MESSAGE").startswith(KILLED_BATCH_PREFIX))
                 )
+            )
+            .select("PIPELINE_NAME", "BATCH_ID", "STATUS",
+                    "BATCH_START_DTTM", "BATCH_END_DTTM")
+        )
+        last_ok = (
+            rows.filter(col("STATUS") == "SUCCESS")
+            .groupBy("PIPELINE_NAME")
+            .agg(spark_max("BATCH_ID").alias("LAST_OK_BATCH_ID"))
+        )
+        take(
+            rows.join(last_ok, "PIPELINE_NAME", "left")
+            .filter(
+                (col("STATUS") == "SUCCESS")
+                | col("LAST_OK_BATCH_ID").isNull()
+                | (col("BATCH_ID") > col("LAST_OK_BATCH_ID"))
             )
             .withColumn("rn", row_number().over(wb))
             .filter(col("rn") <= history)
@@ -531,33 +577,57 @@ def _dump_threads(max_frames=40):
 
 
 # ============================================================
-# Parallel round (max_parallel > 1) -- header F / G
+# Round runner with watchdog (max_parallel >= 1) -- headers F / G / I
 # ============================================================
 
-def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
-                        stop_flag, fits, elapsed, max_parallel, max_attempts,
-                        inter_attempt_wait_seconds, retry_non_transient,
-                        fresh_session_minutes, stall_minutes, heartbeat_minutes,
-                        cutoff_seconds, budget_seconds):
-    """Runs to_run with up to max_parallel pipelines at once. A pipeline starts
-    when every earlier pipeline it is tied to (_depends_on_earlier) has
-    finished, success or failure (as in the sequential loop, which also moves
-    on after a failure). Fills results / failed_pipelines like the sequential
-    loop and returns (pending, stalled):
-      pending = pipelines not run (time limit, or after a stall),
-      stalled = pipelines that were stuck when the watchdog fired."""
+# Storage throttling ("server busy"): worth a longer wait before the retry.
+_BUSY_ERROR = re.compile(
+    r"ServerBusy|Status code 503|TooManyRequests|Status code 429|throttl", re.I
+)
+
+
+def _run_round(to_run, expected, run_id, results, failed_pipelines,
+               stop_flag, fits, elapsed, max_parallel, max_attempts,
+               inter_attempt_wait_seconds, retry_non_transient,
+               fresh_session_minutes, stall_minutes, heartbeat_minutes,
+               cutoff_seconds, budget_seconds, overrun_cap, exempt,
+               busy_retry_wait_seconds, inter_pipeline_wait_seconds,
+               cancel_wait_seconds=120):
+    """Runs to_run with up to max_parallel pipelines at once (1 = one after
+    the other, in config order). Each pipeline runs in a worker thread; this
+    thread keeps the time box and the watchdog. A pipeline starts when every
+    earlier pipeline it is tied to (_depends_on_earlier) has finished, success
+    or failure (the sequential loop also moves on after a failure). Fills
+    results / failed_pipelines like the sequential loop.
+
+    Watchdog (headers G / I): the round stops when
+      - STALL: a pipeline is running but no Spark job has run for
+        stall_minutes, or
+      - OVERRUN: a pipeline's current attempt runs longer than its cap
+        (overrun_cap(name, first_in_fresh_session); None = no cap).
+    Pipelines in `exempt` never trigger it. Its Spark jobs are cancelled and
+    the stopped pipelines are pending (not failed): the next round runs them.
+
+    Returns (pending, stopped, kind):
+      pending = pipelines not run (time limit) or stopped by the watchdog,
+      stopped = pipelines that were running when the watchdog fired,
+      kind    = None, 'STALL' or 'OVERRUN'."""
     deps = _depends_on_earlier(to_run)
     waiting = list(range(len(to_run)))
-    running = {}                  # idx -> start time
+    running = {}                  # idx -> start time of the pipeline
+    attempt_started = {}          # idx -> start time of its current attempt
+    caps = {}                     # idx -> overrun cap in seconds (None = no cap)
     finished = set()
     events = []                   # (idx, ok, res) posted by workers
     sleeping = set()              # workers in their retry wait
     state = threading.Lock()
     last_event = [time.time()]
+    last_end = [None]
     stop_new = False
     first_start = True
-    stalled = []
+    stopped, kind = [], None
     sc = spark.sparkContext
+    sequential = max_parallel == 1
 
     def worker(idx):
         cfg = to_run[idx]
@@ -573,6 +643,8 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
             attempt = 1
             while attempt <= max_attempts:
                 attempt_start = datetime.now()
+                with state:
+                    attempt_started[idx] = time.time()
                 try:
                     res = run_batch_tracked_merge(**_merge_args(cfg, run_id))
                     attempt_end = datetime.now()
@@ -586,26 +658,38 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
                     break
                 except Exception as e:
                     attempt_end = datetime.now()
+                    watchdog_stop = stop_flag.is_set()
                     _append_row(ATTEMPT_TABLE, ORCHESTRATION_ATTEMPT_SCHEMA, [
                         run_id, name, attempt, attempt_start, attempt_end,
-                        "FAILED", str(e),
+                        "FAILED",
+                        ("WATCHDOG_STOP: " if watchdog_stop else "") + str(e),
                         (attempt_end - attempt_start).total_seconds(),
                         None,
                     ])
-                    # No clearCache() here: it would wipe the other running
-                    # pipelines' data; run_batch_tracked_merge already
-                    # unpersisted its own.
+                    # Sequential: release what the failed attempt left cached
+                    # (as v4). Parallel: no clearCache() -- it would wipe the
+                    # other running pipelines' data.
+                    if sequential:
+                        spark.catalog.clearCache()
+                    if watchdog_stop:
+                        print(f"{name}: stopped by the watchdog / round stop "
+                              f"(runs again in the next round)")
+                        break
                     non_transient = isinstance(e, NON_TRANSIENT_ERRORS)
                     retry_fits = fits(exp) and not stop_flag.is_set()
                     can_retry = attempt < max_attempts and retry_fits and (
                         retry_non_transient or not non_transient
                     )
                     if can_retry:
+                        wait = inter_attempt_wait_seconds
+                        if busy_retry_wait_seconds and _BUSY_ERROR.search(str(e)):
+                            wait = max(wait, busy_retry_wait_seconds)
+                            print(f"{name}: storage reported 'busy' -- waiting longer.")
                         print(f"Attempt {attempt} failed for {name}: {e}")
-                        print(f"Waiting {inter_attempt_wait_seconds} seconds before retry...")
+                        print(f"Waiting {wait} seconds before retry...")
                         with state:
                             sleeping.add(idx)
-                        time.sleep(inter_attempt_wait_seconds)
+                        time.sleep(wait)
                         with state:
                             sleeping.discard(idx)
                         attempt += 1
@@ -622,6 +706,11 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
             print(f"{name}: pipeline thread stopped: {e}")
             ok = False
         finally:
+            if sequential:
+                try:
+                    spark.catalog.clearCache()   # as v4, before the next pipeline
+                except Exception:
+                    pass
             with state:
                 events.append((idx, ok, res if ok else None))
                 last_event[0] = time.time()
@@ -629,11 +718,29 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
     def names(idxs):
         return [to_run[i]["pipeline_name"] for i in idxs]
 
+    def collect():
+        with state:
+            done = events[:]
+            events.clear()
+        out = []
+        for idx, ok, res in done:
+            t0 = running.pop(idx)
+            finished.add(idx)
+            last_end[0] = time.time()
+            name = to_run[idx]["pipeline_name"]
+            out.append((idx, ok, res))
+            print(f"<<< END {name}: {'SUCCESS' if ok else 'FAILED'} "
+                  f"({_fmt_min(time.time() - t0)}) | session up {_fmt_min(elapsed())}",
+                  flush=True)
+        return out
+
     last_job = time.time()
     last_beat = time.time()
     while waiting or running:
         # ---- start what is ready (list order), within the time box --------
-        if not stop_new:
+        pause = (sequential and inter_pipeline_wait_seconds and last_end[0] is not None
+                 and time.time() - last_end[0] < inter_pipeline_wait_seconds)
+        if not stop_new and not pause:
             for idx in list(waiting):
                 if len(running) >= max_parallel:
                     break
@@ -650,15 +757,26 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
                     print(f"TIME LIMIT: elapsed {_fmt_min(elapsed())}, {name} expected "
                           f"{_fmt_min(exp)}, start cutoff {_fmt_min(cutoff_seconds)}, "
                           f"must end by {_fmt_min(budget_seconds)}.")
-                    print("No new pipeline starts; waiting for the running ones: "
-                          f"{names(running)}")
+                    if running:
+                        print("No new pipeline starts; waiting for the running ones: "
+                              f"{names(running)}")
+                    else:
+                        print("Stopping cleanly. Not run (next run resumes here): "
+                              f"{names(waiting)}")
                     print("=============================================")
                     break
                 waiting.remove(idx)
                 first_start = False
-                running[idx] = time.time()
+                caps[idx] = overrun_cap(name, first_in_fresh_session)
+                now0 = time.time()
+                running[idx] = now0
+                with state:
+                    attempt_started[idx] = now0
+                cap_txt = f" | watchdog cap {_fmt_min(caps[idx])}" if caps[idx] else ""
                 print(f">>> START {name} | session up {_fmt_min(elapsed())} | "
-                      f"expected {_fmt_min(exp)} | running: {names(running)}", flush=True)
+                      f"expected {_fmt_min(exp)}{cap_txt}"
+                      + (f" | running: {names(running)}" if not sequential else ""),
+                      flush=True)
                 _WorkerThread(target=worker, args=(idx,), daemon=True,
                               name=f"pipeline-{name}").start()
         if stop_new and not running:
@@ -667,20 +785,12 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
         time.sleep(2)
 
         # ---- collect finished pipelines -----------------------------------
-        with state:
-            done = events[:]
-            events.clear()
-        for idx, ok, res in done:
-            t0 = running.pop(idx)
-            finished.add(idx)
+        for idx, ok, res in collect():
             name = to_run[idx]["pipeline_name"]
             if ok:
                 results[name] = res
             else:
                 failed_pipelines.append(name)
-            print(f"<<< END {name}: {'SUCCESS' if ok else 'FAILED'} "
-                  f"({_fmt_min(time.time() - t0)}) | session up {_fmt_min(elapsed())}",
-                  flush=True)
 
         # ---- watchdog --------------------------------------------------------
         now = time.time()
@@ -693,6 +803,9 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
         with state:
             busy = [i for i in running if i not in sleeping]
             quiet_since = max(last_job, last_event[0])
+            over = [i for i in busy
+                    if caps.get(i) and now - attempt_started.get(i, running[i]) > caps[i]]
+        watched = [i for i in busy if to_run[i]["pipeline_name"] not in exempt]
         if heartbeat_minutes and now - last_beat >= heartbeat_minutes * 60 and running:
             last_beat = now
             print(f"... {datetime.now():%H:%M:%S} running: "
@@ -700,12 +813,21 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
                               for i, t in running.items())
                   + f" | active Spark jobs: {len(active_jobs)} | done {len(finished)}"
                   f"/{len(to_run)} | waiting {len(waiting)}", flush=True)
-        if busy and stall_minutes and now - quiet_since > stall_minutes * 60:
-            stalled = names(running)
+        stall = bool(watched) and bool(stall_minutes) and now - quiet_since > stall_minutes * 60
+        if stall or over:
+            kind = "STALL" if stall else "OVERRUN"
+            stopped = names(running)
             print("=============================================")
-            print(f"PARALLEL STALL: {stalled} running but no Spark job for "
-                  f"{_fmt_min(now - quiet_since)}. Stopping this round; the next "
-                  f"round continues SEQUENTIALLY from here.")
+            if stall:
+                print(f"WATCHDOG (STALL): {stopped} running but no Spark job for "
+                      f"{_fmt_min(now - quiet_since)}.")
+            for i in over:
+                print(f"WATCHDOG (OVERRUN): {to_run[i]['pipeline_name']} attempt running "
+                      f"{_fmt_min(now - attempt_started.get(i, running[i]))}, cap "
+                      f"{_fmt_min(caps[i])} (expected {_fmt_min(expected[to_run[i]['pipeline_name']])}).")
+            print("Stopping this round cleanly; the next round (fresh session) runs "
+                  f"{stopped} again" + (" SEQUENTIALLY" if not sequential else "")
+                  + ", without the watchdog for them.")
             print("=============================================")
             _dump_threads()
             stop_flag.set()
@@ -713,11 +835,25 @@ def _run_parallel_round(to_run, expected, run_id, results, failed_pipelines,
                 sc.cancelAllJobs()
             except Exception:
                 pass
+            # Give the workers time to close their batch rows (FAILED) and log
+            # the stopped attempt. A worker stuck outside Spark is left behind;
+            # the next round's cleanup closes its batch row.
+            deadline = time.time() + cancel_wait_seconds
+            while running and time.time() < deadline:
+                time.sleep(2)
+                for idx, ok, res in collect():
+                    name = to_run[idx]["pipeline_name"]
+                    if ok:                      # finished just in time
+                        results[name] = res
+                        stopped.remove(name)
+            if running:
+                print(f"Still running after {cancel_wait_seconds}s (left behind): "
+                      f"{names(running)}")
             break
 
-    # Stuck pipelines are not failures: the next round runs them again.
-    pending = stalled + names(waiting)
-    return pending, stalled
+    # Stopped pipelines are not failures: the next round runs them again.
+    pending = stopped + names(waiting)
+    return pending, stopped, kind
 
 
 # ============================================================
@@ -770,6 +906,11 @@ def run_orchestrator(
     stall_minutes=20,
     parallel_duration_factor=1.3,
     heartbeat_minutes=10,
+    watchdog=True,
+    overrun_factor=2.0,
+    overrun_min_minutes=30,
+    busy_retry_wait_seconds=180,
+    duration_history=3,
 ):
     """
     Runs every config through run_batch_tracked_merge(), one at a time, with
@@ -791,10 +932,20 @@ def run_orchestrator(
     STATUS = 'RUNNING' (after the cleanup). Override with
     allow_run_with_stale_running_run=True.
 
-    max_parallel: 1 = sequential (v3 behaviour). 2..4 = independent pipelines
-    run together (header F), with the hang watchdog (header G, stall_minutes).
-    A round that follows a PARALLEL_STALL in the same resume chain runs
-    sequentially.
+    max_parallel: 1 = sequential (one pipeline at a time, config order).
+    2..4 = independent pipelines run together (header F). A round that follows
+    a parallel watchdog stop in the same resume chain runs sequentially.
+
+    watchdog (header I): True = each pipeline runs in a worker thread and the
+    round stops cleanly when it stalls (no Spark job for stall_minutes) or
+    overruns (attempt longer than max(overrun_factor x expected, expected +
+    overrun_min_minutes); overrun_factor=None turns that part off).
+    watchdog=False with max_parallel=1 = the v4 sequential loop. Parallel
+    mode always has the stall watchdog.
+
+    duration_history: how many recent successful runs set the expected time
+    (header J). busy_retry_wait_seconds: wait before retrying a storage
+    "server busy" error (header K).
     """
     # Count from when the Spark session started (the lifetime clock), not from
     # this call: %run MERGE_NB / CONFIG_NB and earlier cells already used some.
@@ -833,6 +984,15 @@ def run_orchestrator(
 
     batch_tables = sorted({c["batch_table"] for c in pipeline_configs})
     all_names = [c["pipeline_name"] for c in pipeline_configs]
+
+    # Parallel: create missing batch tables here, once, so pipelines running
+    # together do not race to create the same table (first run only).
+    if max_parallel > 1:
+        for bt in batch_tables:
+            try:
+                _ensure_batch_table(bt)          # defined in MERGE_NB
+            except NameError:
+                break
 
     # ---- Cleanup of killed runs, then stale-run guard ----
     if stale_after_hours is not None:
@@ -886,14 +1046,28 @@ def run_orchestrator(
                 rerun_idx.add(j)
                 if n in done_info:
                     redo.add(n)
-    if max_parallel > 1 and resumed_from:
+    # Pipelines the watchdog stopped earlier in this chain run without it now
+    # (header I), and a parallel watchdog stop makes the rest of the chain
+    # sequential (header G).
+    exempt = set()
+    if resumed_from:
         notes = {r["RUN_ID"]: r.get("RUN_NOTE") for r in _recent_runs(limit=50)}
-        stalled_runs = [rid for rid in resumed_from
-                        if (notes.get(rid) or "").startswith("PARALLEL_STALL")]
-        if stalled_runs:
-            print(f"Run(s) {stalled_runs} of this chain stalled in parallel mode -> "
-                  f"this round runs SEQUENTIALLY (max_parallel=1).")
+        parallel_stops = []
+        for rid in resumed_from:
+            note = notes.get(rid) or ""
+            note_kind, _, who = note.partition(": ")
+            if note_kind in ("STALL", "OVERRUN", "PARALLEL_STALL", "PARALLEL_OVERRUN"):
+                exempt.update(n.strip() for n in who.split(",") if n.strip())
+                if note_kind.startswith("PARALLEL_"):
+                    parallel_stops.append(rid)
+        if max_parallel > 1 and parallel_stops:
+            print(f"Run(s) {parallel_stops} of this chain were stopped by the watchdog in "
+                  f"parallel mode -> this round runs SEQUENTIALLY (max_parallel=1).")
             max_parallel = 1
+        if exempt:
+            print(f"Watchdog off for {sorted(exempt)} in this round "
+                  f"(the watchdog stopped them earlier in this chain).")
+    use_threads = max_parallel > 1 or watchdog
     done_names = set(done_info) - redo
     to_run = [c for c in pipeline_configs if c["pipeline_name"] not in done_names]
     skipped_done = [c["pipeline_name"] for c in pipeline_configs
@@ -901,8 +1075,9 @@ def run_orchestrator(
 
     # ---- Expected time per pipeline ----
     history = (
-        _recent_durations([c["pipeline_name"] for c in to_run], batch_tables)
-        if to_run and budget_seconds is not None else {}
+        _recent_durations([c["pipeline_name"] for c in to_run], batch_tables,
+                          history=duration_history)
+        if to_run and (budget_seconds is not None or use_threads) else {}
     )
     expected = {
         c["pipeline_name"]: (
@@ -912,6 +1087,15 @@ def run_orchestrator(
         ) * (parallel_duration_factor if max_parallel > 1 else 1.0)
         for c in to_run
     }
+
+    def overrun_cap(name, first_in_fresh_session):
+        """Seconds an attempt may run before the watchdog stops it (header I),
+        or None (no cap)."""
+        if (not watchdog or not overrun_factor or name in exempt
+                or name not in history or first_in_fresh_session):
+            return None
+        exp = expected[name]
+        return max(overrun_factor * exp, exp + overrun_min_minutes * 60)
 
     run_id = _next_run_id()
 
@@ -932,6 +1116,10 @@ def run_orchestrator(
         print(f"Run again    : {sorted(redo)} (they depend on a pipeline that runs again)")
     print("To run       :", len(to_run))
     print("Parallel     :", max_parallel if max_parallel > 1 else "no (sequential)")
+    if use_threads:
+        print("Watchdog     :", f"stall {stall_minutes} min" + (
+            f", overrun max({overrun_factor:g} x expected, expected + "
+            f"{overrun_min_minutes} min)" if watchdog and overrun_factor else ""))
     if budget_seconds is not None:
         for c in to_run:
             n = c["pipeline_name"]
@@ -951,16 +1139,19 @@ def run_orchestrator(
     results = {}
     failed_pipelines = []
     pending = []          # not run because of the time limit
-    stalled = []          # parallel mode: pipelines stuck when the watchdog fired
+    stalled = []          # pipelines the watchdog stopped
+    watchdog_kind = None  # 'STALL' / 'OVERRUN'
     stop_flag = threading.Event()
 
     try:
-        if max_parallel > 1:
-            pending, stalled = _run_parallel_round(
+        if use_threads:
+            pending, stalled, watchdog_kind = _run_round(
                 to_run, expected, run_id, results, failed_pipelines, stop_flag,
                 fits, elapsed, max_parallel, max_attempts, inter_attempt_wait_seconds,
                 retry_non_transient, fresh_session_minutes, stall_minutes,
                 heartbeat_minutes, cutoff_seconds, budget_seconds,
+                overrun_cap, exempt, busy_retry_wait_seconds,
+                inter_pipeline_wait_seconds,
             )
         else:
             for i, cfg in enumerate(to_run):
@@ -1069,7 +1260,10 @@ def run_orchestrator(
             "FAILED_COUNT": len(failed_pipelines),
             "FAILED_PIPELINE_NAMES": ",".join(failed_pipelines) if failed_pipelines else None,
             "PENDING_PIPELINE_NAMES": ",".join(pending) if pending else None,
-            "RUN_NOTE": ("PARALLEL_STALL: " + ",".join(stalled))[:1000] if stalled else None,
+            "RUN_NOTE": (
+                ("PARALLEL_" if max_parallel > 1 else "") + f"{watchdog_kind}: "
+                + ",".join(stalled)
+            )[:1000] if stalled else None,
         }, lock_timeout=120 if stalled else None)
 
         print("=============================================")
@@ -1092,6 +1286,7 @@ def run_orchestrator(
             "pending_pipelines": pending,
             "skipped_done_pipelines": skipped_done,
             "stalled_pipelines": stalled,
+            "watchdog": watchdog_kind,
         }
 
         if old_session:
@@ -1114,9 +1309,9 @@ def run_orchestrator(
         return outcome
 
     except BaseException as e:
-        # Parallel mode: start no retries, cancel the running Spark jobs.
+        # Worker threads: start no retries, cancel the running Spark jobs.
         stop_flag.set()
-        if max_parallel > 1:
+        if use_threads:
             try:
                 spark.sparkContext.cancelAllJobs()
             except Exception:
@@ -1138,7 +1333,7 @@ def run_orchestrator(
                 "FAILED_PIPELINE_NAMES": (
                     ",".join(failed_pipelines) if failed_pipelines else str(e)[:1000]
                 ),
-            }, lock_timeout=120 if max_parallel > 1 else None)
+            }, lock_timeout=120 if use_threads else None)
         raise
 
 
@@ -1147,8 +1342,9 @@ def run_orchestrator(
 # ============================================================
 
 if __name__ == "__main__":
-    # Sequential (same as v3). For the parallel option use e.g.
-    #   outcome = run_orchestrator(pipeline_configs, max_parallel=2)
+    # Sequential with the watchdog (v5 default). Options, e.g.:
+    #   outcome = run_orchestrator(pipeline_configs, max_parallel=2)   # parallel
+    #   outcome = run_orchestrator(pipeline_configs, watchdog=False)   # = v4
     outcome = run_orchestrator(pipeline_configs)
 
     # Hand the status to the Data pipeline (Until loop checks for
