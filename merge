@@ -1,5 +1,5 @@
 # ============================================================================
-# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v2: faster)
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v3: faster)
 # ============================================================================
 #
 # SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
@@ -38,6 +38,20 @@
 #   9. _CONTROL_LOCK: batch-table writes and BATCH_ID allocation are one at a
 #      time, for the orchestrator's optional parallel mode (no effect when
 #      pipelines run one after another).
+#
+# v3 CHANGE (speed only -- same rows written as v2):
+#
+#  10. Mode A (primary_keys = "", e.g. MEDS, NOTES_C, LABS, FLWSHT): the
+#      target side of the diff reads only ROW_HASH, IS_DELETED, DW_UPDATED_AT
+#      and BATCH_ID. Mode A has no updates, only inserts (hash not active in
+#      the target) and soft deletes (active hash missing from the source), so
+#      the other columns are needed only for the rows being soft-deleted;
+#      those are read back from the target for just those hashes (broadcast
+#      filter; only those rows are shuffled). Before, every run read,
+#      shuffled, sorted and cached the WHOLE target history with all its
+#      columns (NOTE_TEXT included). Same latest-version rule (newest
+#      DW_UPDATED_AT, then BATCH_ID), same I/D conditions, same counts.
+#      Mode B is unchanged. Works with ORCHESTRATOR v4 and v5 as before.
 #
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
@@ -301,6 +315,39 @@ def _latest_target_df(target_table):
     return latest.persist(_PERSIST)
 
 
+# Mode A (v3): the target columns the diff needs.
+_NARROW_COLS = ["ROW_HASH", "IS_DELETED", "DW_UPDATED_AT", "BATCH_ID"]
+# Soft-delete rows read back with a broadcast filter up to this many hashes
+# (beyond it Spark picks the join itself).
+_BROADCAST_DELETE_ROWS = 2_000_000
+
+
+def _latest_target_narrow(target_table):
+    """
+    Mode A (v3): latest version per ROW_HASH, like _latest_target_df, but only
+    the 4 system columns -- reading, shuffling, sorting and caching the whole
+    history with every business column is what made big mode A targets slow.
+    Hash-partitioned on ROW_HASH (the sync joins with the staged source need
+    no shuffle). Persisted; the caller unpersists.
+    """
+    df = (
+        spark.table(target_table)
+        .select(*_NARROW_COLS)
+        .repartition(_num_partitions(), col("ROW_HASH"))
+    )
+    w = Window.partitionBy("ROW_HASH").orderBy(desc("DW_UPDATED_AT"), desc("BATCH_ID"))
+    latest = (
+        df.withColumn("_rn", row_number().over(w))
+          .filter(col("_rn") == 1)
+          .drop("_rn")
+    )
+    return latest.persist(_PERSIST)
+
+
+def _is_narrow_latest(df):
+    return {c.lower() for c in df.columns} <= {c.lower() for c in _NARROW_COLS}
+
+
 def _add_sequential_key(df, name, start):
     """
     Adds `name` = start+1 .. start+N, in parallel (no single-partition window).
@@ -485,66 +532,135 @@ def deltaUpsertAndSync(
         cached.append(stagedDf)
         views.append(sview)
 
+    # Mode A uses the narrow latest versions (v3, header 10); mode B, or a
+    # caller-supplied full latestDf, the v2 full outer join.
     owns_latest = latestDf is None
-    latest_df = _latest_target_df(targetTable) if owns_latest else latestDf
+    narrow = not spec["pkList"] and (owns_latest or _is_narrow_latest(latestDf))
     if owns_latest:
+        latest_df = (_latest_target_narrow(targetTable) if narrow
+                     else _latest_target_df(targetTable))
         cached.append(latest_df)
+    else:
+        latest_df = latestDf
 
     src_view = _safe_name("_syncsrc_", targetTable)
     latest_view = _safe_name("_latest_", targetTable)
     changes_view = _safe_name("_chg_", targetTable)
+    del_view = _safe_name("_delh_", targetTable)
     stagedDf.createOrReplaceTempView(src_view)
     latest_df.createOrReplaceTempView(latest_view)
-    views += [src_view, latest_view, changes_view]
+    views += [src_view, latest_view, changes_view, del_view]
 
     try:
         before_active = latest_df.filter(
             coalesce(col("is_deleted"), lit(0)) == 0
         ).count()
 
-        # Upsert rows take the source values, soft-delete rows the target's.
-        selCols = []
-        for c in allColsList:
-            if keyLookup is not None and c == identityLower:
-                selCols.append(
-                    f"CASE WHEN src.{RH_COL} IS NOT NULL THEN CAST(NULL AS BIGINT) "
-                    f"ELSE tgt.{c} END AS {c}"
-                )
-            else:
-                selCols.append(
-                    f"CASE WHEN src.{RH_COL} IS NOT NULL THEN src.{c} "
-                    f"ELSE tgt.{c} END AS {c}"
-                )
-
-        # change_type: I = insert/revival, U = update of active entity, D = soft delete
-        #   upsert (src row) : tgt.row_hash IS NULL OR tgt.is_deleted = 1 [OR attr change]
-        #   soft delete      : no src row AND tgt.is_deleted = 0
-        selectSql = f"""
+        if narrow:
+            # Mode A, narrow target side (v3, header 10). Same rows as the
+            # full outer join below; mode A has no U rows (no attribute check):
+            #   I = source row whose hash has no active latest version
+            #       (tgt.row_hash IS NULL OR tgt.is_deleted = 1)
+            #   D = latest version with is_deleted = 0 whose hash is not in the
+            #       source; its columns are read back from the target (latest
+            #       version of that hash, same ordering as everywhere else).
+            mode = "full-row-hash"
+            print(f"Running sync for target table: {targetTable} [{mode} mode]...")
+            ins_cols = ", ".join(f"src.{c} AS {c}" for c in allColsList)
+            ins_df = spark.sql(f"""
     SELECT
-        {', '.join(selCols)},
-        CASE WHEN src.{RH_COL} IS NOT NULL THEN src.{RH_COL} ELSE tgt.row_hash END AS row_hash,
-        CASE WHEN src.{RH_COL} IS NOT NULL THEN 0 ELSE 1 END AS is_deleted,
+        {ins_cols},
+        src.{RH_COL} AS row_hash,
+        0 AS is_deleted,
         current_timestamp() AS dw_updated_at,
         {batchIdLiteral} AS batch_id,
-        CASE WHEN src.{RH_COL} IS NULL THEN 'D'
-             WHEN tgt.row_hash IS NOT NULL AND coalesce(tgt.is_deleted, 0) = 0 THEN 'U'
-             ELSE 'I' END AS {CHG_TAG}
+        'I' AS {CHG_TAG}
     FROM {src_view} src
-    FULL OUTER JOIN {latest_view} tgt
+    LEFT JOIN {latest_view} tgt
         ON src.{RH_COL} = tgt.row_hash
-    WHERE (src.{RH_COL} IS NOT NULL
-           AND (tgt.row_hash IS NULL
-                OR tgt.is_deleted = 1
-                {attrChangeCheck}))
-       OR (src.{RH_COL} IS NULL AND tgt.is_deleted = 0)
-    """
+    WHERE tgt.row_hash IS NULL OR tgt.is_deleted = 1
+    """)
+            del_hashes = spark.sql(f"""
+    SELECT tgt.row_hash
+    FROM {latest_view} tgt
+    LEFT ANTI JOIN {src_view} src
+        ON src.{RH_COL} = tgt.row_hash
+    WHERE tgt.is_deleted = 0
+    """).persist(_PERSIST)
+            cached.append(del_hashes)
+            n_del = del_hashes.count()
+            if n_del > 0:
+                del_hashes.createOrReplaceTempView(del_view)
+                hint = "/*+ BROADCAST(d) */" if n_del <= _BROADCAST_DELETE_ROWS else ""
+                del_cols = ", ".join(f"t.{c} AS {c}" for c in allColsList)
+                del_df = spark.sql(f"""
+    SELECT
+        {del_cols},
+        t.row_hash AS row_hash,
+        1 AS is_deleted,
+        current_timestamp() AS dw_updated_at,
+        {batchIdLiteral} AS batch_id,
+        'D' AS {CHG_TAG}
+    FROM (
+        SELECT {hint} x.*,
+               ROW_NUMBER() OVER (PARTITION BY x.row_hash
+                                  ORDER BY x.dw_updated_at DESC, x.batch_id DESC) AS __sync_rn__
+        FROM {targetTable} x
+        LEFT SEMI JOIN {del_view} d
+            ON x.row_hash <=> d.row_hash
+    ) t
+    WHERE t.__sync_rn__ = 1
+    """)
+                changes = ins_df.unionByName(del_df)
+            else:
+                changes = ins_df
+            # Evaluate the diff once, keep it, count it, then append it.
+            changes_df = changes.persist(_PERSIST)
+            cached.append(changes_df)
+        else:
+            # Upsert rows take the source values, soft-delete rows the target's.
+            selCols = []
+            for c in allColsList:
+                if keyLookup is not None and c == identityLower:
+                    selCols.append(
+                        f"CASE WHEN src.{RH_COL} IS NOT NULL THEN CAST(NULL AS BIGINT) "
+                        f"ELSE tgt.{c} END AS {c}"
+                    )
+                else:
+                    selCols.append(
+                        f"CASE WHEN src.{RH_COL} IS NOT NULL THEN src.{c} "
+                        f"ELSE tgt.{c} END AS {c}"
+                    )
 
-        mode = "natural-key" if spec["pkList"] else "full-row-hash"
-        print(f"Running sync for target table: {targetTable} [{mode} mode]...")
+            # change_type: I = insert/revival, U = update of active entity, D = soft delete
+            #   upsert (src row) : tgt.row_hash IS NULL OR tgt.is_deleted = 1 [OR attr change]
+            #   soft delete      : no src row AND tgt.is_deleted = 0
+            selectSql = f"""
+        SELECT
+            {', '.join(selCols)},
+            CASE WHEN src.{RH_COL} IS NOT NULL THEN src.{RH_COL} ELSE tgt.row_hash END AS row_hash,
+            CASE WHEN src.{RH_COL} IS NOT NULL THEN 0 ELSE 1 END AS is_deleted,
+            current_timestamp() AS dw_updated_at,
+            {batchIdLiteral} AS batch_id,
+            CASE WHEN src.{RH_COL} IS NULL THEN 'D'
+                 WHEN tgt.row_hash IS NOT NULL AND coalesce(tgt.is_deleted, 0) = 0 THEN 'U'
+                 ELSE 'I' END AS {CHG_TAG}
+        FROM {src_view} src
+        FULL OUTER JOIN {latest_view} tgt
+            ON src.{RH_COL} = tgt.row_hash
+        WHERE (src.{RH_COL} IS NOT NULL
+               AND (tgt.row_hash IS NULL
+                    OR tgt.is_deleted = 1
+                    {attrChangeCheck}))
+           OR (src.{RH_COL} IS NULL AND tgt.is_deleted = 0)
+        """
 
-        # Evaluate the diff once, keep it, count it, then append it.
-        changes_df = spark.sql(selectSql).persist(_PERSIST)
-        cached.append(changes_df)
+            mode = "natural-key" if spec["pkList"] else "full-row-hash"
+            print(f"Running sync for target table: {targetTable} [{mode} mode]...")
+
+            # Evaluate the diff once, keep it, count it, then append it.
+            changes_df = spark.sql(selectSql).persist(_PERSIST)
+            cached.append(changes_df)
         counts = {
             r[CHG_TAG]: r["count"]
             for r in changes_df.groupBy(CHG_TAG).count().collect()
@@ -932,7 +1048,8 @@ def run_batch_tracked_merge(
         print("Source Record Count:", source_count)
 
         # ---- Step 5: execute the sync ---------------------------------------
-        latest_df = _latest_target_df(target_table)
+        latest_df = (_latest_target_df(target_table) if pk_cols
+                     else _latest_target_narrow(target_table))      # v3, header 10
         cached_dfs.append(latest_df)
 
         result = deltaUpsertAndSync(
@@ -1088,4 +1205,3 @@ def run_all_pipelines(
 #
 #   summary = run_all_pipelines(pipeline_configs, pause_seconds=30)
 # ============================================================================
-
