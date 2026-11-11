@@ -1,5 +1,43 @@
 # ============================================================
-# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v5
+# ORCHESTRATOR NOTEBOOK  (time-boxed + resumable)  -- v6
+#
+# v6 = v5 + faster scheduling. Same sync, same results, same logs.
+#
+#   L. TWO PIPELINES AT A TIME BY DEFAULT (the "Run it" cell calls
+#      run_orchestrator(pipeline_configs, max_parallel=2)). The run of
+#      2026-11-10 was ~4h of work done one after the other (MEDS 86 min,
+#      NOTES_C 51 min, ...); most pipelines do not depend on each other, so
+#      two run side by side. Dependencies are kept exactly as in v4/v5: a
+#      pipeline starts only after every earlier pipeline it is tied to has
+#      finished, so it reads the same inputs as in a sequential run.
+#      max_parallel=1 = the v5 sequential loop.
+#   M. LONGEST CHAIN FIRST (parallel mode only). Of the pipelines that are
+#      ready, the one with the longest expected chain (its own expected time
+#      plus the longest chain of pipelines waiting for it) starts first:
+#      TBL_PAT_ID and PAT_ENC, then MEDS with the light pipelines next to it
+#      (NOTES_C after MEDS, header P), so the long ones do not end up last
+#      and alone. A pipeline that no longer fits the time box is
+#      skipped and runs in the next round; shorter ones may still start.
+#      Sequential mode keeps config order and v5's stop rule.
+#   N. While pipelines share the session, a pipeline can wait for free cores
+#      (Spark FIFO scheduling), so it can take much longer than alone. In
+#      parallel mode the OVERRUN stop (header I) therefore uses a bigger
+#      margin: max(2 x expected, expected + 90 min)
+#      (overrun_min_minutes_parallel). It still catches a pipeline that hangs
+#      with Spark jobs running (like NOTES_C on 2026-11-09) before the 4h
+#      kill. The STALL stop (no Spark job at all for stall_minutes) is
+#      unchanged, and after any parallel stop the next round runs
+#      sequentially (header G), as before.
+#   O. The start banner prints the Spark scheduler mode (FIFO / FAIR).
+#   P. TWO HEAVY PIPELINES NEVER RUN TOGETHER (parallel mode). A pipeline
+#      whose recent time (history, before the safety factors) is at least
+#      heavy_minutes (30) is heavy: today MEDS and NOTES_C. A heavy pipeline
+#      runs next to light ones, never next to another heavy one, so the two
+#      biggest caches never compete for executor memory (a local test showed
+#      that memory pressure can end in an OutOfMemoryError). A pipeline with
+#      no history counts as heavy. heavy_minutes=None turns this off.
+#
+# ---- v5 notes ----
 #
 # v5 = v4 + two fixes from the 2026-11-09 run (7h36m wall clock for about
 # 3.5h of pipeline work: TBL_ALLERGY_NOTES_C ran 2h50m in an older session
@@ -592,7 +630,7 @@ def _run_round(to_run, expected, run_id, results, failed_pipelines,
                fresh_session_minutes, stall_minutes, heartbeat_minutes,
                cutoff_seconds, budget_seconds, overrun_cap, exempt,
                busy_retry_wait_seconds, inter_pipeline_wait_seconds,
-               cancel_wait_seconds=120):
+               cancel_wait_seconds=120, heavy=frozenset()):
     """Runs to_run with up to max_parallel pipelines at once (1 = one after
     the other, in config order). Each pipeline runs in a worker thread; this
     thread keeps the time box and the watchdog. A pipeline starts when every
@@ -625,6 +663,13 @@ def _run_round(to_run, expected, run_id, results, failed_pipelines,
     last_end = [None]
     stop_new = False
     first_start = True
+    time_skipped = []             # parallel: did not fit the time box (header M)
+    # Parallel start priority (header M): own expected time + the longest
+    # chain of pipelines that wait for it. deps only point to earlier configs.
+    prio = {}
+    for i in reversed(range(len(to_run))):
+        tail = [prio[j] for j in range(i + 1, len(to_run)) if i in deps[j]]
+        prio[i] = expected[to_run[i]["pipeline_name"]] + (max(tail) if tail else 0)
     stopped, kind = [], None
     sc = spark.sparkContext
     sequential = max_parallel == 1
@@ -737,21 +782,38 @@ def _run_round(to_run, expected, run_id, results, failed_pipelines,
     last_job = time.time()
     last_beat = time.time()
     while waiting or running:
-        # ---- start what is ready (list order), within the time box --------
+        # ---- start what is ready, within the time box -----------------------
+        # Sequential: config order; the first one that does not fit ends the
+        # round (v5). Parallel (header M): longest chain first; one that
+        # does not fit is skipped, shorter ones may still start.
         pause = (sequential and inter_pipeline_wait_seconds and last_end[0] is not None
                  and time.time() - last_end[0] < inter_pipeline_wait_seconds)
+        started_now = False
         if not stop_new and not pause:
-            for idx in list(waiting):
+            ready = [i for i in waiting if deps[i] <= finished]
+            if not sequential:
+                ready.sort(key=lambda i: -prio[i])
+            for idx in ready:
                 if len(running) >= max_parallel:
                     break
-                if not deps[idx] <= finished:
-                    continue
                 name = to_run[idx]["pipeline_name"]
+                if (not sequential and name in heavy and any(
+                        to_run[j]["pipeline_name"] in heavy for j in running)):
+                    continue      # header P: not next to another heavy pipeline
                 exp = expected[name]
                 first_in_fresh_session = (
                     first_start and elapsed() < fresh_session_minutes * 60
                 )
                 if not first_in_fresh_session and not fits(exp):
+                    if not sequential:
+                        if name not in time_skipped:
+                            time_skipped.append(name)
+                            print(f"TIME LIMIT: {name} (expected {_fmt_min(exp)}) does not fit "
+                                  f"any more (session up {_fmt_min(elapsed())}, start cutoff "
+                                  f"{_fmt_min(cutoff_seconds)}, must end by "
+                                  f"{_fmt_min(budget_seconds)}); it runs in the next round.",
+                                  flush=True)
+                        continue
                     stop_new = True
                     print("=============================================")
                     print(f"TIME LIMIT: elapsed {_fmt_min(elapsed())}, {name} expected "
@@ -779,7 +841,15 @@ def _run_round(to_run, expected, run_id, results, failed_pipelines,
                       flush=True)
                 _WorkerThread(target=worker, args=(idx,), daemon=True,
                               name=f"pipeline-{name}").start()
+                started_now = True
         if stop_new and not running:
+            break
+        if not sequential and waiting and not running and not started_now:
+            # Parallel: nothing runs and nothing more can start this session.
+            print("=============================================")
+            print(f"TIME LIMIT: nothing more fits this session (up {_fmt_min(elapsed())}). "
+                  f"Not run (next run resumes here): {names(waiting)}")
+            print("=============================================")
             break
 
         time.sleep(2)
@@ -909,8 +979,10 @@ def run_orchestrator(
     watchdog=True,
     overrun_factor=2.0,
     overrun_min_minutes=30,
+    overrun_min_minutes_parallel=90,
     busy_retry_wait_seconds=180,
     duration_history=3,
+    heavy_minutes=30,
 ):
     """
     Runs every config through run_batch_tracked_merge(), one at a time, with
@@ -941,7 +1013,12 @@ def run_orchestrator(
     overruns (attempt longer than max(overrun_factor x expected, expected +
     overrun_min_minutes); overrun_factor=None turns that part off).
     watchdog=False with max_parallel=1 = the v4 sequential loop. Parallel
-    mode always has the stall watchdog.
+    mode always has the stall watchdog; its overrun margin is
+    overrun_min_minutes_parallel instead of overrun_min_minutes (header N).
+
+    heavy_minutes (header P): in parallel mode, pipelines whose recent time
+    is at least this many minutes (or that have no history) never run at the
+    same time as each other. None = no such rule.
 
     duration_history: how many recent successful runs set the expected time
     (header J). busy_retry_wait_seconds: wait before retrying a storage
@@ -1088,6 +1165,13 @@ def run_orchestrator(
         for c in to_run
     }
 
+    # Heavy pipelines (header P): never two of them at the same time.
+    heavy = frozenset(
+        c["pipeline_name"] for c in to_run
+        if max_parallel > 1 and heavy_minutes
+        and history.get(c["pipeline_name"], float("inf")) >= heavy_minutes * 60
+    )
+
     def overrun_cap(name, first_in_fresh_session):
         """Seconds an attempt may run before the watchdog stops it (header I),
         or None (no cap)."""
@@ -1095,7 +1179,9 @@ def run_orchestrator(
                 or name not in history or first_in_fresh_session):
             return None
         exp = expected[name]
-        return max(overrun_factor * exp, exp + overrun_min_minutes * 60)
+        margin = (overrun_min_minutes if max_parallel == 1         # v6, header N
+                  else overrun_min_minutes_parallel)
+        return max(overrun_factor * exp, exp + margin * 60)
 
     run_id = _next_run_id()
 
@@ -1116,10 +1202,19 @@ def run_orchestrator(
         print(f"Run again    : {sorted(redo)} (they depend on a pipeline that runs again)")
     print("To run       :", len(to_run))
     print("Parallel     :", max_parallel if max_parallel > 1 else "no (sequential)")
+    if heavy:                                               # v6, header P
+        print("Heavy        :", sorted(heavy), "(never two of them at the same time)")
     if use_threads:
         print("Watchdog     :", f"stall {stall_minutes} min" + (
             f", overrun max({overrun_factor:g} x expected, expected + "
-            f"{overrun_min_minutes} min)" if watchdog and overrun_factor else ""))
+            f"{overrun_min_minutes if max_parallel == 1 else overrun_min_minutes_parallel} min)"
+            if watchdog and overrun_factor else ""))
+    if max_parallel > 1:
+        print("Start order  : longest expected chain first (of the pipelines that are ready)")
+    try:                                                    # v6, header O
+        print("Scheduler    :", spark.sparkContext.getConf().get("spark.scheduler.mode", "FIFO"))
+    except Exception:
+        pass
     if budget_seconds is not None:
         for c in to_run:
             n = c["pipeline_name"]
@@ -1151,7 +1246,7 @@ def run_orchestrator(
                 retry_non_transient, fresh_session_minutes, stall_minutes,
                 heartbeat_minutes, cutoff_seconds, budget_seconds,
                 overrun_cap, exempt, busy_retry_wait_seconds,
-                inter_pipeline_wait_seconds,
+                inter_pipeline_wait_seconds, heavy=heavy,
             )
         else:
             for i, cfg in enumerate(to_run):
@@ -1342,10 +1437,10 @@ def run_orchestrator(
 # ============================================================
 
 if __name__ == "__main__":
-    # Sequential with the watchdog (v5 default). Options, e.g.:
-    #   outcome = run_orchestrator(pipeline_configs, max_parallel=2)   # parallel
-    #   outcome = run_orchestrator(pipeline_configs, watchdog=False)   # = v4
-    outcome = run_orchestrator(pipeline_configs)
+    # v6 default: two pipelines at a time (header L). Options, e.g.:
+    #   outcome = run_orchestrator(pipeline_configs, max_parallel=1)   # = v5 sequential
+    #   outcome = run_orchestrator(pipeline_configs, max_parallel=3)   # three at a time
+    outcome = run_orchestrator(pipeline_configs, max_parallel=2)
 
     # Hand the status to the Data pipeline (Until loop checks for
     # 'STOPPED_TIME_LIMIT' and starts a fresh session to continue).
