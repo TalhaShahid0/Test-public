@@ -1,4 +1,24 @@
 # ============================================================================
+# CONFIG v3 (2026-11-11): only the TBL_ALLERGY_MEDS query changed.
+#
+# The other 24 configs are byte-identical to CONFIG_NB_latest_active.py.
+# MEDS returns exactly the same rows as before (tested against a literal Spark
+# translation of the Oracle MV ALLERGY.MV_ALLERGY_MEDS and against the
+# previous query). Only the way Spark runs it changed:
+#   1. the cohort patients (small) are broadcast, so PAT_ENC is filtered while
+#      it is read instead of being shuffled in full by PAT_ID
+#   2. encounter -> medicine links use a hash join, so the very large
+#      PAT_ENC_CURR_MEDS side is not sorted
+#   3. MDL_MD_PRBLM_LIST is joined to ORDER_MED once per order, before the
+#      big join
+#   4. CLARITY_MEDICATION + its 3 class names are joined once per medicine
+#      (small) and broadcast
+#   5. so after the ORDER_MED join the ~300M encounter x medicine rows are not
+#      shuffled again, and SELECT DISTINCT runs without a shuffle
+# Targets, keys, columns, identity and dependencies are unchanged.
+# ============================================================================
+
+# ============================================================================
 # CONFIG_NB (latest active version)
 #
 # Same as optimized_v2/CONFIG_NB.py, except: a query that joins one of OUR
@@ -1007,12 +1027,15 @@ pipeline_configs = [
                 WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
             ),
             pat AS (
-                SELECT p.pat_id, p.pat_mrn_id
+                SELECT /*+ BROADCAST(a) */ p.pat_id, p.pat_mrn_id
                 FROM CLARITY_LH.CLARITY.PATIENT p
                 LEFT SEMI JOIN active_pat_ids a ON p.pat_id = a.PAT_ID
             ),
+            -- (1) cohort patients are few: broadcast them, so PAT_ENC is filtered
+            --     while it is read instead of being shuffled in full by PAT_ID
             enc AS (
-                SELECT pat.pat_id, pat.pat_mrn_id, pe.pat_enc_csn_id, pe.appt_prc_id,
+                SELECT /*+ BROADCAST(pat) */
+                       pat.pat_id, pat.pat_mrn_id, pe.pat_enc_csn_id, pe.appt_prc_id,
                        pe.appt_status_c, pe.contact_date, pe.enc_close_date, pe.department_id
                 FROM CLARITY_LH.CLARITY.PAT_ENC pe
                 INNER JOIN pat ON pe.pat_id = pat.pat_id
@@ -1027,11 +1050,38 @@ pipeline_configs = [
                        CAST(NULL AS STRING) AS is_active_yn
                 FROM CLARITY_LH.CLARITY.PAT_ENC_IP_MEDS peim
             ),
+            -- (2) hash join on the encounter side: the huge PAT_ENC_CURR_MEDS side is
+            --     no longer sorted, only looked up
             enc_meds AS (
-                SELECT e.*, l.src_branch, l.order_med_id, l.is_active_yn
+                SELECT /*+ SHUFFLE_HASH(e) */ e.*, l.src_branch, l.order_med_id, l.is_active_yn
                 FROM enc e
                 INNER JOIN med_links l ON e.pat_enc_csn_id = l.pat_enc_csn_id
+            ),
+            -- (3) MDL_MD_PRBLM_LIST is joined to ORDER_MED once per order, before
+            --     the big join, so the encounter x medicine rows are never
+            --     shuffled again by MDL_ID
+            om AS (
+                SELECT o.order_med_id, o.ordering_date, o.sig, o.hv_discrete_dose,
+                       o.min_discrete_dose, o.max_discrete_dose, o.quantity, o.refills,
+                       o.start_date, o.end_date, o.order_class_c, o.medication_id,
+                       o.hv_dose_unit_c, o.med_route_c, o.hv_discr_freq_id, o.ordering_mode_c,
+                       mmpl.crrnt_long_term_yn
+                FROM CLARITY_LH.CLARITY.ORDER_MED o
+                LEFT JOIN CLARITY_LH.CLARITY.MDL_MD_PRBLM_LIST mmpl ON o.mdl_id = mmpl.med_prblm_list_id
+            ),
+            -- (4) CLARITY_MEDICATION + its 3 class names joined once per medicine
+            --     (small), then broadcast: no shuffle by MEDICATION_ID
+            med AS (
+                SELECT /*+ BROADCAST(ztc, zpc, zps) */
+                       cm.medication_id, cm.name, cm.generic_name,
+                       ztc.name AS therclass, zpc.name AS pharmclass, zps.name AS pharmsubclass
+                FROM CLARITY_LH.CLARITY.CLARITY_MEDICATION cm
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_THERA_CLASS ztc     ON cm.thera_class_c = ztc.thera_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_CLASS zpc     ON cm.pharm_class_c = zpc.pharm_class_c
+                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_SUBCLASS zps  ON cm.pharm_subclass_c = zps.pharm_subclass_c
             )
+            -- (5) after the ORDER_MED join every other join is a broadcast, so the
+            --     rows stay grouped by ORDER_MED_ID and DISTINCT needs no shuffle
             SELECT PAT_ID, PAT_MRN_ID, APPT_PRC_ID, APPT_STATUS_C, CONTACT_DATE,
                    ENC_CLOSE_DATE, ORDER_MED_ID, ORDERING_DATE, FREQ_NAME, SIG,
                    HV_DISCRETE_DOSE, MIN_DISCRETE_DOSE, MAX_DISCRETE_DOSE, QUANTITY, REFILLS,
@@ -1040,7 +1090,7 @@ pipeline_configs = [
                    MEDROUTE, THERCLASS, PHARMCLASS, PHARMSUBCLASS, GENERIC_NAME,
                    DEPARTMENT_ID, DEPARTMENT_NAME
             FROM (
-                SELECT /*+ BROADCAST(zoc, zmu, zar, ipf, ztc, zpc, zps, cd, zom) */ DISTINCT
+                SELECT /*+ BROADCAST(med, zoc, zmu, zar, ipf, cd, zom) */ DISTINCT
                     em.src_branch           AS SRC_BRANCH,
                     em.pat_id               AS PAT_ID,
                     em.pat_mrn_id           AS PAT_MRN_ID,
@@ -1059,36 +1109,32 @@ pipeline_configs = [
                     om.refills              AS REFILLS,
                     om.start_date           AS START_DATE,
                     om.end_date             AS END_DATE,
-                    cm.name                 AS NAME,
+                    med.name                AS NAME,
                     em.pat_enc_csn_id       AS PAT_ENC_CSN_ID,
                     em.is_active_yn         AS IS_ACTIVE_YN,
-                    mmpl.crrnt_long_term_yn AS CRRNT_LONG_TERM_YN,
+                    om.crrnt_long_term_yn   AS CRRNT_LONG_TERM_YN,
                     om.order_class_c        AS ORDER_CLASS_C,
                     zom.name                AS ORDERING_MODE,
                     zmu.name                AS MEDUNIT,
                     zoc.name                AS ORDERCLASS,
                     zar.name                AS MEDROUTE,
-                    ztc.name                AS THERCLASS,
-                    zpc.name                AS PHARMCLASS,
-                    zps.name                AS PHARMSUBCLASS,
-                    cm.generic_name         AS GENERIC_NAME,
+                    med.therclass           AS THERCLASS,
+                    med.pharmclass          AS PHARMCLASS,
+                    med.pharmsubclass       AS PHARMSUBCLASS,
+                    med.generic_name        AS GENERIC_NAME,
                     em.department_id        AS DEPARTMENT_ID,
                     cd.department_name      AS DEPARTMENT_NAME
                 FROM enc_meds em
-                INNER JOIN CLARITY_LH.CLARITY.ORDER_MED om              ON om.order_med_id = em.order_med_id
-                LEFT JOIN CLARITY_LH.CLARITY.CLARITY_MEDICATION cm      ON om.medication_id = cm.medication_id
-                LEFT JOIN CLARITY_LH.CLARITY.MDL_MD_PRBLM_LIST mmpl     ON om.mdl_id = mmpl.med_prblm_list_id
+                INNER JOIN om                                           ON om.order_med_id = em.order_med_id
+                LEFT JOIN med                                           ON om.medication_id = med.medication_id
                 LEFT JOIN CLARITY_LH.CLARITY.ZC_ORDER_CLASS zoc         ON om.order_class_c = zoc.order_class_c
                 LEFT JOIN CLARITY_LH.CLARITY.ZC_MED_UNIT zmu            ON om.hv_dose_unit_c = zmu.disp_qtyunit_c
                 LEFT JOIN CLARITY_LH.CLARITY.ZC_ADMIN_ROUTE zar         ON om.med_route_c = zar.med_route_c
                 LEFT JOIN CLARITY_LH.CLARITY.IP_FREQUENCY ipf           ON om.hv_discr_freq_id = ipf.freq_id
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_THERA_CLASS ztc         ON cm.thera_class_c = ztc.thera_class_c
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_CLASS zpc         ON cm.pharm_class_c = zpc.pharm_class_c
-                LEFT JOIN CLARITY_LH.CLARITY.ZC_PHARM_SUBCLASS zps      ON cm.pharm_subclass_c = zps.pharm_subclass_c
                 LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP cd             ON em.department_id = cd.department_id
                 LEFT JOIN CLARITY_LH.CLARITY.ZC_ORDERING_MODE zom       ON om.ordering_mode_c = zom.ordering_mode_c
             ) d
-        """,
+""",
         "primary_keys": "",
         "non_key_columns": "PAT_ID,PAT_MRN_ID,APPT_PRC_ID,APPT_STATUS_C,CONTACT_DATE,ENC_CLOSE_DATE,ORDER_MED_ID,ORDERING_DATE,FREQ_NAME,SIG,HV_DISCRETE_DOSE,MIN_DISCRETE_DOSE,MAX_DISCRETE_DOSE,QUANTITY,REFILLS,START_DATE,END_DATE,NAME,PAT_ENC_CSN_ID,IS_ACTIVE_YN,CRRNT_LONG_TERM_YN,ORDER_CLASS_C,ORDERING_MODE,MEDUNIT,ORDERCLASS,MEDROUTE,THERCLASS,PHARMCLASS,PHARMSUBCLASS,GENERIC_NAME,DEPARTMENT_ID,DEPARTMENT_NAME",
         "identity_column": "ALLERGY_MEDS_KEY",
