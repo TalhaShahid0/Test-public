@@ -1,5 +1,5 @@
 # ============================================================================
-# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v3.1: faster)
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v4: faster)
 # ============================================================================
 #
 # SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
@@ -66,6 +66,27 @@
 #      max key, source query + staging, target latest versions, rows to
 #      soft-delete, changes computed, append to target), so a slow
 #      pipeline shows where its time went. Printing only.
+#
+# v4 CHANGES (same rows as v3.1):
+#
+#  13. Mode A: ONE pass over the staged source and the target's latest
+#      versions finds both the rows to insert and the hashes to soft-delete
+#      (a FULL OUTER JOIN on the hash with the same conditions as the two
+#      v3.1 joins: insert = source row whose hash has no active latest
+#      version; soft-delete = active latest version whose hash is not in
+#      the source). v3.1 read both big cached copies twice for this (a LEFT
+#      JOIN and a LEFT ANTI JOIN). The rows written are the same.
+#  14. No extra full counts: the source count from staging is reused, and
+#      the latest versions are counted once (total and active together).
+#      v3.1 counted the staged source (all of MEDS' 318M rows) and the
+#      latest versions again only to choose the join type.
+#  15. Step times (printing only), mode A: "compare with target" (the one
+#      pass of 13) replaces "rows to soft-delete" and "changes computed";
+#      the append step reads the target for the rows being soft-deleted, so
+#      it is printed as "soft-delete rows read back + append to target".
+#      After "target latest versions" an "[info]" line shows how much
+#      cached data the Spark session holds (in memory / on disk) and how
+#      many executors and cores it has.
 #
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
@@ -363,6 +384,21 @@ def _fmt_secs(sec):
     return f"{sec / 60:.1f} min" if sec >= 60 else f"{sec:.0f} s"
 
 
+def _session_info():
+    """Printing only (v4, header 15): cached data in this Spark session right
+    now (all pipelines) and its executors / cores."""
+    try:
+        sc = spark.sparkContext
+        infos = sc._jsc.sc().getRDDStorageInfo()
+        mem = sum(i.memSize() for i in infos) / 2 ** 30
+        disk = sum(i.diskSize() for i in infos) / 2 ** 30
+        n_exec = max(sc._jsc.sc().getExecutorMemoryStatus().size() - 1, 0)
+        return (f"cached now: {mem:.1f} GB in memory + {disk:.1f} GB on disk | "
+                f"executors: {n_exec}, cores: {sc.defaultParallelism}")
+    except Exception as e:                      # never fails the pipeline
+        return f"(no cache info: {str(e)[:80]})"
+
+
 def _latest_target_narrow(target_table):
     """
     Mode A (v3): latest version per ROW_HASH, like _latest_target_df, but only
@@ -533,6 +569,7 @@ def deltaUpsertAndSync(
     latestDf=None,
     stagedDf=None,
     keyLookup=None,
+    sourceCount=None,
 ):
     """
     Appends new records, updates and soft deletes to a Delta table. Never
@@ -551,6 +588,9 @@ def deltaUpsertAndSync(
 
     keyLookup (mode B, from run_batch_tracked_merge): {"max_key", "target_has_key"}
     -- upsert rows get their identity after the diff (_fill_lookup_keys).
+
+    sourceCount (v4, from run_batch_tracked_merge): row count of stagedDf, so
+    it is not counted again. None = count it here when needed.
 
     Returns dict: inserted, updated, deleted, before_active, after_active.
     """
@@ -594,10 +634,17 @@ def deltaUpsertAndSync(
     views += [src_view, latest_view, changes_view, del_view]
 
     try:
-        before_active = latest_df.filter(
-            coalesce(col("is_deleted"), lit(0)) == 0
-        ).count()
+        # v4 (header 14): total and active latest versions in one pass.
+        lc = latest_df.agg(
+            spark_count(lit(1)).alias("n"),
+            spark_sum(when(coalesce(col("is_deleted"), lit(0)) == 0, 1)
+                      .otherwise(0)).alias("active"),
+        ).collect()[0]
+        latest_count = lc["n"]
+        before_active = lc["active"] or 0
         _step("target latest versions")
+        if getattr(_STEP_CLOCK, "t0", None) is not None:
+            print(f"   [info] {_session_info()}", flush=True)
 
         if narrow:
             # Mode A, narrow target side (v3, header 10). Same rows as the
@@ -609,40 +656,64 @@ def deltaUpsertAndSync(
             #       version of that hash, same ordering as everywhere else).
             mode = "full-row-hash"
             print(f"Running sync for target table: {targetTable} [{mode} mode]...")
-            ins_cols = ", ".join(f"src.{c} AS {c}" for c in allColsList)
             # v3.1 (header 11): hash joins -- both sides are already
             # partitioned on the hash, so no shuffle and no sort of the source.
             n_parts = max(_num_partitions(), 1)
+            src_count = sourceCount if sourceCount is not None else stagedDf.count()
             hash_join = (
-                max(latest_df.count(), stagedDf.count()) / n_parts
+                max(latest_count, src_count) / n_parts
                 <= _HASH_JOIN_MAX_ROWS_PER_PARTITION
             )
-            hint_ins = "/*+ SHUFFLE_HASH(tgt) */" if hash_join else ""
-            hint_del = "/*+ SHUFFLE_HASH(src) */" if hash_join else ""
+            hint = "/*+ SHUFFLE_HASH(tgt) */" if hash_join else ""
+            # v4 (header 13): ONE pass finds both kinds of rows, with the
+            # conditions of the two v3.1 joins:
+            #   I: source row, and its hash has no latest version or the
+            #      latest version is soft-deleted (v3.1: LEFT JOIN, WHERE
+            #      tgt.row_hash IS NULL OR tgt.is_deleted = 1)
+            #   D: latest version with is_deleted = 0 whose hash no source row
+            #      has (v3.1: LEFT ANTI JOIN, WHERE tgt.is_deleted = 0)
+            # __sync_src__ marks the source side (NULL = no source row).
+            diff_cols = ", ".join(f"src.{c} AS {c}" for c in allColsList)
+            diff_df = spark.sql(f"""
+    SELECT {hint}
+        {diff_cols},
+        src.{RH_COL} AS {RH_COL},
+        tgt.row_hash AS __sync_tgt_rh__,
+        CASE WHEN src.__sync_src__ IS NULL THEN 'D' ELSE 'I' END AS __sync_kind__
+    FROM (SELECT *, true AS __sync_src__ FROM {src_view}) src
+    FULL OUTER JOIN {latest_view} tgt
+        ON src.{RH_COL} = tgt.row_hash
+    WHERE (src.__sync_src__ IS NOT NULL
+           AND (tgt.row_hash IS NULL OR tgt.is_deleted = 1))
+       OR (src.__sync_src__ IS NULL AND tgt.is_deleted = 0)
+    """).persist(_PERSIST)
+            cached.append(diff_df)
+            diff_view = _safe_name("_diff_", targetTable)
+            diff_df.createOrReplaceTempView(diff_view)
+            views.append(diff_view)
+            kinds = {
+                r["__sync_kind__"]: r["count"]
+                for r in diff_df.groupBy("__sync_kind__").count().collect()
+            }
+            n_del = kinds.get("D", 0)
+            _step("compare with target")
+            ins_cols = ", ".join(f"{c} AS {c}" for c in allColsList)
             ins_df = spark.sql(f"""
-    SELECT {hint_ins}
+    SELECT
         {ins_cols},
-        src.{RH_COL} AS row_hash,
+        {RH_COL} AS row_hash,
         0 AS is_deleted,
         current_timestamp() AS dw_updated_at,
         {batchIdLiteral} AS batch_id,
         'I' AS {CHG_TAG}
-    FROM {src_view} src
-    LEFT JOIN {latest_view} tgt
-        ON src.{RH_COL} = tgt.row_hash
-    WHERE tgt.row_hash IS NULL OR tgt.is_deleted = 1
+    FROM {diff_view}
+    WHERE __sync_kind__ = 'I'
     """)
-            del_hashes = spark.sql(f"""
-    SELECT {hint_del} tgt.row_hash
-    FROM {latest_view} tgt
-    LEFT ANTI JOIN {src_view} src
-        ON src.{RH_COL} = tgt.row_hash
-    WHERE tgt.is_deleted = 0
-    """).persist(_PERSIST)
-            cached.append(del_hashes)
-            n_del = del_hashes.count()
-            _step("rows to soft-delete")
             if n_del > 0:
+                del_hashes = spark.sql(
+                    f"SELECT __sync_tgt_rh__ AS row_hash FROM {diff_view} "
+                    f"WHERE __sync_kind__ = 'D'"
+                )
                 del_hashes.createOrReplaceTempView(del_view)
                 hint = "/*+ BROADCAST(d) */" if n_del <= _BROADCAST_DELETE_ROWS else ""
                 del_cols = ", ".join(f"t.{c} AS {c}" for c in allColsList)
@@ -667,9 +738,15 @@ def deltaUpsertAndSync(
                 changes = ins_df.unionByName(del_df)
             else:
                 changes = ins_df
-            # Evaluate the diff once, keep it, count it, then append it.
-            changes_df = changes.persist(_PERSIST)
-            cached.append(changes_df)
+            # v4 (header 13): the diff is already kept (diff_df) and counted.
+            # The change set is appended straight from it; the rows to
+            # soft-delete are read back from the target inside the append
+            # (one query, so I and D rows share one dw_updated_at, as in
+            # v3.1). Each D hash gives exactly one D row (ROW_NUMBER = 1), so
+            # the counts are those of the diff. Not caching the change set
+            # again also keeps a first load at two copies of the source.
+            changes_df = changes
+            counts = {"I": kinds.get("I", 0), "D": n_del}
         else:
             # Upsert rows take the source values, soft-delete rows the target's.
             selCols = []
@@ -714,11 +791,11 @@ def deltaUpsertAndSync(
             # Evaluate the diff once, keep it, count it, then append it.
             changes_df = spark.sql(selectSql).persist(_PERSIST)
             cached.append(changes_df)
-        counts = {
-            r[CHG_TAG]: r["count"]
-            for r in changes_df.groupBy(CHG_TAG).count().collect()
-        }
-        _step("changes computed")
+            counts = {
+                r[CHG_TAG]: r["count"]
+                for r in changes_df.groupBy(CHG_TAG).count().collect()
+            }
+            _step("changes computed")
         inserted = counts.get("I", 0)
         updated = counts.get("U", 0)
         deleted = counts.get("D", 0)
@@ -733,7 +810,8 @@ def deltaUpsertAndSync(
                 f"INSERT INTO {targetTable} ({insertCols}) "
                 f"SELECT {insertCols} FROM {changes_view}"
             )
-            _step("append to target")
+            _step("soft-delete rows read back + append to target"
+                  if narrow and deleted > 0 else "append to target")
         else:
             print("   No changes detected; nothing appended.")
 
@@ -1121,6 +1199,7 @@ def run_batch_tracked_merge(
             latestDf=latest_df,
             stagedDf=sync_df,
             keyLookup=key_lookup,
+            sourceCount=source_count,       # v4, header 14
         )
 
         inserted_count = result["inserted"]
