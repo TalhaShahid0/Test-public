@@ -1,5 +1,5 @@
 # ============================================================================
-# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v3: faster)
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v3.1: faster)
 # ============================================================================
 #
 # SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
@@ -52,6 +52,20 @@
 #      columns (NOTE_TEXT included). Same latest-version rule (newest
 #      DW_UPDATED_AT, then BATCH_ID), same I/D conditions, same counts.
 #      Mode B is unchanged. Works with ORCHESTRATOR v4 and v5 as before.
+#
+# v3.1 CHANGES (same rows as v3):
+#
+#  11. Mode A: the two sync joins (source vs target latest versions) are
+#      shuffled hash joins instead of sort-merge joins. Both sides are
+#      already hash-partitioned the same way, so this only drops the sort
+#      of the whole staged source (all columns) that the sort-merge join
+#      needed on every incremental run. Same join type and conditions, so
+#      the same rows. Used while a partition holds at most
+#      _HASH_JOIN_MAX_ROWS_PER_PARTITION rows (else the v3 join).
+#  12. Each pipeline prints how long each step took ("[time] ..." lines:
+#      max key, source query + staging, target latest versions, rows to
+#      soft-delete, changes computed, append to target), so a slow
+#      pipeline shows where its time went. Printing only.
 #
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
@@ -320,6 +334,33 @@ _NARROW_COLS = ["ROW_HASH", "IS_DELETED", "DW_UPDATED_AT", "BATCH_ID"]
 # Soft-delete rows read back with a broadcast filter up to this many hashes
 # (beyond it Spark picks the join itself).
 _BROADCAST_DELETE_ROWS = 2_000_000
+# Mode A (v3.1, header 11): hash joins while a partition holds at most this
+# many rows on the hashed side (~4M rows of hash + 3 small columns is a few
+# hundred MB per task).
+_HASH_JOIN_MAX_ROWS_PER_PARTITION = 4_000_000
+
+# Step times (v3.1, header 12). One clock per thread: in the orchestrator's
+# parallel mode every pipeline runs in its own thread.
+_STEP_CLOCK = threading.local()
+
+
+def _step_start(name):
+    _STEP_CLOCK.name = name
+    _STEP_CLOCK.t0 = _STEP_CLOCK.last = time.time()
+
+
+def _step(label):
+    t0 = getattr(_STEP_CLOCK, "t0", None)
+    if t0 is None:
+        return
+    now = time.time()
+    print(f"   [time] {_STEP_CLOCK.name} | {label}: {_fmt_secs(now - _STEP_CLOCK.last)} "
+          f"(pipeline so far {_fmt_secs(now - t0)})", flush=True)
+    _STEP_CLOCK.last = now
+
+
+def _fmt_secs(sec):
+    return f"{sec / 60:.1f} min" if sec >= 60 else f"{sec:.0f} s"
 
 
 def _latest_target_narrow(target_table):
@@ -526,6 +567,7 @@ def deltaUpsertAndSync(
 
     owns_staged = stagedDf is None
     if owns_staged:
+        _step_start(targetTable)        # called on its own (v3.1, header 12)
         _, sview, stagedDf = _stage_source(
             sourceQuery, targetTable, spec["rowHashExpr"], view_prefix="_srcs_"
         )
@@ -555,6 +597,7 @@ def deltaUpsertAndSync(
         before_active = latest_df.filter(
             coalesce(col("is_deleted"), lit(0)) == 0
         ).count()
+        _step("target latest versions")
 
         if narrow:
             # Mode A, narrow target side (v3, header 10). Same rows as the
@@ -567,8 +610,17 @@ def deltaUpsertAndSync(
             mode = "full-row-hash"
             print(f"Running sync for target table: {targetTable} [{mode} mode]...")
             ins_cols = ", ".join(f"src.{c} AS {c}" for c in allColsList)
+            # v3.1 (header 11): hash joins -- both sides are already
+            # partitioned on the hash, so no shuffle and no sort of the source.
+            n_parts = max(_num_partitions(), 1)
+            hash_join = (
+                max(latest_df.count(), stagedDf.count()) / n_parts
+                <= _HASH_JOIN_MAX_ROWS_PER_PARTITION
+            )
+            hint_ins = "/*+ SHUFFLE_HASH(tgt) */" if hash_join else ""
+            hint_del = "/*+ SHUFFLE_HASH(src) */" if hash_join else ""
             ins_df = spark.sql(f"""
-    SELECT
+    SELECT {hint_ins}
         {ins_cols},
         src.{RH_COL} AS row_hash,
         0 AS is_deleted,
@@ -581,7 +633,7 @@ def deltaUpsertAndSync(
     WHERE tgt.row_hash IS NULL OR tgt.is_deleted = 1
     """)
             del_hashes = spark.sql(f"""
-    SELECT tgt.row_hash
+    SELECT {hint_del} tgt.row_hash
     FROM {latest_view} tgt
     LEFT ANTI JOIN {src_view} src
         ON src.{RH_COL} = tgt.row_hash
@@ -589,6 +641,7 @@ def deltaUpsertAndSync(
     """).persist(_PERSIST)
             cached.append(del_hashes)
             n_del = del_hashes.count()
+            _step("rows to soft-delete")
             if n_del > 0:
                 del_hashes.createOrReplaceTempView(del_view)
                 hint = "/*+ BROADCAST(d) */" if n_del <= _BROADCAST_DELETE_ROWS else ""
@@ -665,6 +718,7 @@ def deltaUpsertAndSync(
             r[CHG_TAG]: r["count"]
             for r in changes_df.groupBy(CHG_TAG).count().collect()
         }
+        _step("changes computed")
         inserted = counts.get("I", 0)
         updated = counts.get("U", 0)
         deleted = counts.get("D", 0)
@@ -679,6 +733,7 @@ def deltaUpsertAndSync(
                 f"INSERT INTO {targetTable} ({insertCols}) "
                 f"SELECT {insertCols} FROM {changes_view}"
             )
+            _step("append to target")
         else:
             print("   No changes detected; nothing appended.")
 
@@ -968,6 +1023,8 @@ def run_batch_tracked_merge(
         spec = _sync_spec(target_table, primary_keys, effective_non_key_columns,
                           identity_column)
 
+        _step_start(pipeline_name)      # v3.1, header 12
+
         # ---- Step 3a: stage the source ONCE (row_hash computed here) --------
         mode_a_keys = bool(identity_column) and not pk_cols
         staged_query, src_view, src_df = _stage_source(
@@ -1006,6 +1063,7 @@ def run_batch_tracked_merge(
                     .agg(coalesce(spark_max(col(identity_column)), lit(0)).alias("m"))
                     .collect()[0]["m"]
                 )
+                _step("max key in target")
 
             if not pk_cols:
                 # ---- Mode A: every source row gets max+1..max+N -------------
@@ -1046,6 +1104,7 @@ def run_batch_tracked_merge(
         if source_count is None:
             source_count = src_df.count()
         print("Source Record Count:", source_count)
+        _step("source query + staging")
 
         # ---- Step 5: execute the sync ---------------------------------------
         latest_df = (_latest_target_df(target_table) if pk_cols
