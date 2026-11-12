@@ -1,20 +1,52 @@
 # One-time check (read only, ~1-3 min). Paste into a NEW notebook cell, run it,
 # and send the whole output. It changes nothing.
 # It shows how big one Spark session is (executors / cores) and how big the
-# tables behind MEDS and NOTES_C are, so the next speed steps can be sized.
+# tables behind the slow pipelines are, so the next speed steps can be sized.
+# v2 (2026-11-12): works on Spark 4 too (a setting that is not set no longer
+# stops the cell), and every part runs even if an earlier part fails.
+import re
 
 sc = spark.sparkContext
 conf = sc.getConf()
-n_exec = max(sc._jsc.sc().getExecutorMemoryStatus().size() - 1, 0)
+
+
+def setting(k):
+    try:
+        return spark.conf.get(k)
+    except Exception:
+        return conf.get(k, "not set")
+
+
 print("== session")
-print("spark version:", spark.version)
-print("executors now:", n_exec, "| defaultParallelism (total cores):", sc.defaultParallelism)
-for k in ["spark.executor.cores", "spark.executor.memory", "spark.driver.cores", "spark.driver.memory",
+try:
+    n_exec = max(sc._jsc.sc().getExecutorMemoryStatus().size() - 1, 0)
+    print("spark version:", spark.version)
+    print("executors now:", n_exec, "| defaultParallelism (total cores):", sc.defaultParallelism)
+except Exception as e:
+    print("session info failed:", str(e)[:150])
+for k in ["spark.executor.cores", "spark.executor.memory", "spark.executor.instances",
+          "spark.driver.cores", "spark.driver.memory", "spark.driver.maxResultSize",
           "spark.dynamicAllocation.enabled", "spark.dynamicAllocation.minExecutors",
-          "spark.dynamicAllocation.maxExecutors", "spark.sql.shuffle.partitions",
-          "spark.sql.autoBroadcastJoinThreshold", "spark.sql.adaptive.enabled",
+          "spark.dynamicAllocation.maxExecutors", "spark.dynamicAllocation.initialExecutors",
+          "spark.sql.shuffle.partitions", "spark.sql.autoBroadcastJoinThreshold",
+          "spark.sql.adaptive.enabled", "spark.sql.ansi.enabled",
+          "spark.sql.requireAllClusterKeysForCoPartition",
           "spark.native.enabled", "spark.gluten.enabled"]:
-    print(f"{k} = {conf.get(k, spark.conf.get(k, 'not set'))}")
+    print(f"{k} = {setting(k)}")
+
+print("== pool / node settings of this session (names only, no secrets)")
+try:
+    skip = re.compile(r"token|secret|password|sas|credential|auth|cert|key$", re.I)
+    want = re.compile(r"pool|node|vcore|autoscale|capacity", re.I)
+    found = 0
+    for k, v in sorted(conf.getAll()):
+        if want.search(k) and not skip.search(k):
+            print(f"{k} = {str(v)[:100]}")
+            found += 1
+    if not found:
+        print("(none)")
+except Exception as e:
+    print("could not list:", str(e)[:150])
 
 print("== tables (Delta metadata only, no full scan)")
 tables = [
@@ -22,8 +54,11 @@ tables = [
     "CLARITY_LH.CLARITY.PAT_ENC_CURR_MEDS", "CLARITY_LH.CLARITY.PAT_ENC_IP_MEDS", "CLARITY_LH.CLARITY.ORDER_MED",
     "CLARITY_LH.CLARITY.MDL_MD_PRBLM_LIST", "CLARITY_LH.CLARITY.CLARITY_MEDICATION",
     "CLARITY_LH.CLARITY.PAT_ENC", "CLARITY_LH.CLARITY.PATIENT",
+    "CLARITY_LH.CLARITY.IP_FLWSHT_MEAS", "CLARITY_LH.CLARITY.IP_FLWSHT_REC",
+    "CLARITY_LH.CLARITY.ORDER_PROC", "CLARITY_LH.CLARITY.ORDER_RESULTS",
     "ALLERGY_LH.ALLERGY_DELTA.TBL_PAT_ID", "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_PAT_ENC",
     "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_MEDS", "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_NOTES_C",
+    "ALLERGY_LH.ALLERGY_DELTA.TBL_ALLERGY_LABS_POP",
 ]
 for t in tables:
     try:
