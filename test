@@ -1,6 +1,58 @@
-SELECT BATCH_ID, STATUS, BATCH_START_DTTM, BATCH_END_DTTM,
-       SOURCE_RECORD_COUNT, INSERTED_RECORD_COUNT,
-       DELETED_RECORD_COUNT, TOTAL_TARGET_COUNT
-FROM ALLERGY_LH.ALLERGY_DELTA.ALLERGY_BATCHES
-WHERE PIPELINE_NAME = 'TBL_ALLERGY_MEDS'
-ORDER BY BATCH_ID;
+# ============================================================================
+# CHECK_NOTES_PLAN (2026-11-12). READ ONLY, about 10 seconds. Runs no query.
+#
+# Shows (1) whether the TBL_ALLERGY_NOTES_C query of the CONFIG loaded in this
+# session is the v4 one, and (2) how Spark plans to read the 3 big note tables:
+#   "filtered by the broadcast list"  = v4 works (only allergy notes move)
+#   "FULL shuffle"                    = the whole table is moved (v3 behaviour)
+#
+# HOW TO RUN (a new notebook in the same workspace):
+#   CELL 1:  %run CONFIG_NB      (the same CONFIG notebook the pipeline uses)
+#   CELL 2:  this file. Send the output.
+# ============================================================================
+
+q = {c["pipeline_name"]: c for c in pipeline_configs}["TBL_ALLERGY_NOTES_C"]["source_query"]
+print("v4 hints in the loaded CONFIG:",
+      "BROADCAST(cced, nti)" in q, "| BROADCAST(n) count:", q.count("BROADCAST(n)"), "(v4 = True | 2)")
+
+_BIG = ["HNO_NOTE_TEXT", "NOTE_ENC_INFO", "HNO_INFO"]
+_aqe = spark.conf.get("spark.sql.adaptive.enabled")
+spark.conf.set("spark.sql.adaptive.enabled", "false")      # static plan only, nothing runs
+try:
+    _plan = spark.sql(q)._jdf.queryExecution().executedPlan()
+finally:
+    spark.conf.set("spark.sql.adaptive.enabled", _aqe)
+
+
+def _kids(n):
+    c = n.children()
+    return [c.apply(i) for i in range(c.size())]
+
+
+_found = {}
+
+
+def _walk(node):
+    if node.nodeName() in ("Exchange", "ShuffleExchange"):
+        stack, scans, filtered = _kids(node), [], False
+        while stack:                      # everything below this shuffle, down to the next one
+            n = stack.pop()
+            nn = n.nodeName()
+            if nn in ("Exchange", "ShuffleExchange", "BroadcastExchange", "ReusedExchange"):
+                continue
+            if nn == "BroadcastHashJoin" and ("LeftSemi" in n.simpleString(300) or "Inner" in n.simpleString(300)):
+                filtered = True
+            if "Scan" in nn:
+                s = n.simpleString(2000).upper()
+                scans += [t for t in _BIG if t in s]
+            stack.extend(_kids(n))
+        for t in scans:
+            _found.setdefault(t, []).append("filtered by the broadcast list, then shuffled" if filtered
+                                            else "FULL shuffle")
+    for k in _kids(node):
+        _walk(k)
+
+
+_walk(_plan)
+for t in _BIG:
+    print(f"{t}: {_found.get(t, ['no shuffle at all'])}")
