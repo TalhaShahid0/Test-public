@@ -1,4 +1,25 @@
 # ============================================================================
+# CONFIG v4 (2026-11-12): faster NOTES_C and FLWSHT queries (same rows).
+#
+# Only HOW Spark runs these 2 queries changed; the rows are the same as v3.
+# TBL_ALLERGY_NOTES_C (hints only):
+#   1. BROADCAST(cced): the allergy encounters are sent to every machine, so
+#      HNO_INFO is filtered while it is read (no shuffle of all notes)
+#   2. BROADCAST(n) (twice): the allergy note ids are sent to every machine,
+#      so NOTE_ENC_INFO and HNO_NOTE_TEXT are filtered while they are read.
+#      Before, Spark shuffled the text of every note in the system by NOTE_ID
+#      just to keep the allergy notes.
+# TBL_ALLERGY_FLWSHT: the template measures (small; same 5 joins and the same
+#   TEMPLATE_ID filter) are a named set that is broadcast, so IP_FLWSHT_MEAS is
+#   filtered while it is read; PAT_ENC is joined to the cohort first (cohort
+#   broadcast). Same inner joins, only grouped differently.
+# The other 23 configs are byte-identical to CONFIG_NB_latest_active_v3.py.
+# If NOTES_C ever fails with a broadcast / memory / maxResultSize error, its
+# lists are too big to broadcast: in its query change BROADCAST(cced, nti) back
+# to BROADCAST(nti), delete the two /*+ BROADCAST(n) */, and send the error.
+# ============================================================================
+
+# ============================================================================
 # CONFIG v3 (2026-11-11): only the TBL_ALLERGY_MEDS query changed.
 #
 # The other 24 configs are byte-identical to CONFIG_NB_latest_active.py.
@@ -640,20 +661,69 @@ pipeline_configs = [
                     FROM CLARITY_LH.CLARITY.IP_FLO_MEASUREMNTS
                 )
                 WHERE R = 1
+            ),
+            -- v4 (speed only, same rows): the template measures (a small set:
+            -- same 5 joins and the same TEMPLATE_ID filter as before) get a
+            -- name, so they can be broadcast and IP_FLWSHT_MEAS is filtered
+            -- while it is read instead of being shuffled in full.
+            TM AS (
+                SELECT
+                    FD.TEMPLATE_ID AS TEMPLATE_ID,
+                    FD.TEMPLATE_NAME AS TEMPLATE_NAME,
+                    FD.DISPLAY_NAME AS DISPLAY_NAME,
+                    FD.TIME_INTERVAL AS TIME_INTERVAL,
+                    GPD1.FLO_MEAS_ID AS GPD1_FLO_MEAS_ID,
+                    GPD1.ABBREVIATION AS GPD1_ABBREVIATION,
+                    GPD1.DISP_NAME AS GPD1_DISP_NAME,
+                    FM.GRP_FLO_MEAS_ID AS GRP_FLO_MEAS_ID,
+                    GPD2.DISP_NAME AS GPD2_DISP_NAME,
+                    GPD2.VAL_TYPE_C AS GPD2_VAL_TYPE_C
+                FROM CLARITY_LH.CLARITY.IP_FLT_DATA FD
+                INNER JOIN CLARITY_LH.CLARITY.IP_FLT_COMPS CM
+                    ON CM.TEMPLATE_ID = FD.TEMPLATE_ID
+                INNER JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA GPD1
+                    ON GPD1.FLO_MEAS_ID = CM.FLO_MEAS_ID
+                INNER JOIN FM
+                    ON FM.FLO_MEAS_ID = CM.FLO_MEAS_ID
+                INNER JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA GPD2
+                    ON GPD2.FLO_MEAS_ID = FM.GRP_FLO_MEAS_ID
+                WHERE FD.TEMPLATE_ID IN (
+                '312','360','361','364','365','362',
+                '210401435','210400957','210401586','210401477','210401451','210401563',
+                '2100200032','2100200000','2100200222','2100200110','2100200166','2100200071',
+                '702','703','210101378','210100046',
+                '270','279','280',
+                '210001486','210001591','210001597'
             )
-            SELECT DISTINCT
-                FD.TEMPLATE_ID AS TEMPLATE_ID,
-                FD.TEMPLATE_NAME AS TEMPLATE_NAME,
-                FD.DISPLAY_NAME AS DISPLAY_NAME,
-                FD.TIME_INTERVAL AS TIME_INTERVAL,
-                GPD1.FLO_MEAS_ID AS FLO_MEAS_ID,
-                GPD1.ABBREVIATION AS GRP_ABB,
-                GPD1.DISP_NAME AS DISP_NAME,
-                PE.PAT_ID AS PAT_ID,
-                PE.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
-                PE.CONTACT_DATE AS CONTACT_DATE,
+            ),
+            -- v4 (speed only, same rows): encounters of the cohort patients.
+            -- The cohort (small) is broadcast, so PAT_ENC is filtered while it
+            -- is read. Same inner joins as before, only grouped differently.
+            PEP AS (
+                SELECT /*+ BROADCAST(PAT) */
+                    PE.PAT_ID AS PAT_ID,
+                    PE.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                    PE.CONTACT_DATE AS CONTACT_DATE,
+                    PE.DEPARTMENT_ID AS DEPARTMENT_ID,
+                    PE.INPATIENT_DATA_ID AS INPATIENT_DATA_ID,
+                    PAT.PAT_MRN_ID AS PAT_MRN_ID
+                FROM CLARITY_LH.CLARITY.PAT_ENC PE
+                INNER JOIN {ACTIVE_TBL_PAT_ID} PAT
+                    ON PAT.PAT_ID = PE.PAT_ID
+            )
+            SELECT /*+ BROADCAST(TM) */ DISTINCT
+                TM.TEMPLATE_ID AS TEMPLATE_ID,
+                TM.TEMPLATE_NAME AS TEMPLATE_NAME,
+                TM.DISPLAY_NAME AS DISPLAY_NAME,
+                TM.TIME_INTERVAL AS TIME_INTERVAL,
+                TM.GPD1_FLO_MEAS_ID AS FLO_MEAS_ID,
+                TM.GPD1_ABBREVIATION AS GRP_ABB,
+                TM.GPD1_DISP_NAME AS DISP_NAME,
+                PEP.PAT_ID AS PAT_ID,
+                PEP.PAT_ENC_CSN_ID AS PAT_ENC_CSN_ID,
+                PEP.CONTACT_DATE AS CONTACT_DATE,
                 FLM.FLO_MEAS_ID AS MEAS_ID,
-                GPD2.DISP_NAME AS FLO_DIS_NAME,
+                TM.GPD2_DISP_NAME AS FLO_DIS_NAME,
                 FLM.MEAS_VALUE AS MEAS_VALUE,
                 CASE
                     WHEN UPPER(ZVT.NAME) = 'DATE'
@@ -663,41 +733,23 @@ pipeline_configs = [
                 FLM.MEAS_COMMENT AS MEAS_COMMENT,
                 FLM.LINE AS LINE,
                 DATE(FLM.RECORDED_TIME) AS RECORDED_DATE,
-                PAT.PAT_MRN_ID AS PAT_MRN_ID,
-                PE.DEPARTMENT_ID AS DEPARTMENT_ID,
+                PEP.PAT_MRN_ID AS PAT_MRN_ID,
+                PEP.DEPARTMENT_ID AS DEPARTMENT_ID,
                 CDEPT.DEPARTMENT_NAME AS DEPARTMENT_NAME,
                 FLM.RECORDED_TIME AS RECORDED_TIME,
                 FLM.ENTRY_TIME AS ENTRY_TIME,
                 FLM.ENTRY_USER_ID AS ENTRY_USER_ID
-            FROM CLARITY_LH.CLARITY.IP_FLT_DATA FD
-            INNER JOIN CLARITY_LH.CLARITY.IP_FLT_COMPS CM
-                ON CM.TEMPLATE_ID = FD.TEMPLATE_ID
-            INNER JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA GPD1
-                ON GPD1.FLO_MEAS_ID = CM.FLO_MEAS_ID
-            INNER JOIN FM
-                ON FM.FLO_MEAS_ID = CM.FLO_MEAS_ID
-            INNER JOIN CLARITY_LH.CLARITY.IP_FLO_GP_DATA GPD2
-                ON GPD2.FLO_MEAS_ID = FM.GRP_FLO_MEAS_ID
+            FROM TM
             INNER JOIN CLARITY_LH.CLARITY.IP_FLWSHT_MEAS FLM
-                ON FLM.FLO_MEAS_ID = FM.GRP_FLO_MEAS_ID
+                ON FLM.FLO_MEAS_ID = TM.GRP_FLO_MEAS_ID
             INNER JOIN CLARITY_LH.CLARITY.IP_FLWSHT_REC FR
                 ON FR.FSD_ID = FLM.FSD_ID
-            INNER JOIN CLARITY_LH.CLARITY.PAT_ENC PE
-                ON PE.INPATIENT_DATA_ID = FR.INPATIENT_DATA_ID
-            INNER JOIN {ACTIVE_TBL_PAT_ID} PAT
-                ON PAT.PAT_ID = PE.PAT_ID
+            INNER JOIN PEP
+                ON PEP.INPATIENT_DATA_ID = FR.INPATIENT_DATA_ID
             LEFT JOIN CLARITY_LH.CLARITY.CLARITY_DEP CDEPT
-                ON CDEPT.DEPARTMENT_ID = PE.DEPARTMENT_ID
+                ON CDEPT.DEPARTMENT_ID = PEP.DEPARTMENT_ID
             LEFT JOIN CLARITY_LH.CLARITY.ZC_VAL_TYPE ZVT
-                ON ZVT.VAL_TYPE_C = GPD2.VAL_TYPE_C
-            WHERE FD.TEMPLATE_ID IN (
-                '312','360','361','364','365','362',
-                '210401435','210400957','210401586','210401477','210401451','210401563',
-                '2100200032','2100200000','2100200222','2100200110','2100200166','2100200071',
-                '702','703','210101378','210100046',
-                '270','279','280',
-                '210001486','210001591','210001597'
-            )
+                ON ZVT.VAL_TYPE_C = TM.GPD2_VAL_TYPE_C
         """,
         "primary_keys": "",
         "non_key_columns": "TEMPLATE_ID, TEMPLATE_NAME, DISPLAY_NAME, TIME_INTERVAL, FLO_MEAS_ID, GRP_ABB, DISP_NAME, PAT_ID, PAT_ENC_CSN_ID, CONTACT_DATE, MEAS_ID, FLO_DIS_NAME, MEAS_VALUE, MEAS_VALUE_CVERT, MEAS_COMMENT, LINE, RECORDED_DATE, PAT_MRN_ID, DEPARTMENT_ID, DEPARTMENT_NAME, RECORDED_TIME, ENTRY_TIME, ENTRY_USER_ID",
@@ -1901,7 +1953,7 @@ pipeline_configs = [
                 WHERE rn = 1 AND COALESCE(IS_DELETED, 0) = 0
             ),
             notes AS (
-                SELECT /*+ BROADCAST(nti) */
+                SELECT /*+ BROADCAST(cced, nti) */
                     hno.PAT_ENC_CSN_ID,
                     hno.IP_NOTE_TYPE_C,
                     nti.NAME AS IP_NOTE_TYPE,
@@ -1938,7 +1990,7 @@ pipeline_configs = [
                     znf.NAME                  AS NOTE_FORMAT,
                     e.SPEC_NOTE_TIME_DTTM     AS SPECIFIED_DATETIME
                 FROM (
-                    SELECT *
+                    SELECT /*+ BROADCAST(n) */ *
                     FROM CLARITY_LH.CLARITY.NOTE_ENC_INFO x
                     LEFT SEMI JOIN note_ids n ON x.NOTE_ID = n.NOTE_ID
                 ) e
@@ -1954,7 +2006,7 @@ pipeline_configs = [
                     ON e.NOTE_STATUS_C = ns.NOTE_STATUS_C
             ),
             hnt AS (
-                SELECT h.NOTE_ID, h.NOTE_CSN_ID, h.CONTACT_DATE_REAL, h.LINE, h.NOTE_TEXT
+                SELECT /*+ BROADCAST(n) */ h.NOTE_ID, h.NOTE_CSN_ID, h.CONTACT_DATE_REAL, h.LINE, h.NOTE_TEXT
                 FROM CLARITY_LH.CLARITY.HNO_NOTE_TEXT h
                 LEFT SEMI JOIN note_ids n ON h.NOTE_ID = n.NOTE_ID
                 WHERE length(trim(h.NOTE_TEXT)) > 0
