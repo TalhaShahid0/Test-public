@@ -1,66 +1,57 @@
 # ============================================================================
-# CHECK_NATIVE_ENGINE (2026-11-12). READ ONLY: writes nothing, changes no table.
+# CHECK_NATIVE_DIFF (2026-11-13). READ ONLY: writes nothing, changes no table.
 #
-# Question: if the Fabric Native Execution Engine is switched on, do the
-# pipelines still give exactly the same rows and the same ROW_HASH? And how
-# much faster are their source queries with it?
+# CHECK_NATIVE_ENGINE said DIFFERENT for TBL_ALLERGY_NOTES_C (same row count,
+# different ROW_HASH in some rows). This check finds WHICH column differs
+# between the native engine and normal Spark, in how many rows, and what kind
+# of difference it is.
 #
-# For each pipeline of the chosen GROUP it runs the source query twice in the
-# same session, first with the native engine ON, then OFF (normal Spark), and
-# compares a fingerprint of the result:
-#   - number of rows
-#   - ROW_HASH exactly as MERGE computes it (MERGE's own _sync_spec)
-#   - a second hash over ALL business columns, so every value is compared
-#     (for the 3 tables with primary keys, ROW_HASH covers only the keys)
-# "SAME" = same row count and the same set of hashes. Any "DIFFERENT" means
-# the native engine must NOT be switched on for the pipeline.
+# It prints NO note text and NO values. Only column names, counts and
+# "kinds" of difference: a letter A-Z is shown as A, a-z as a, a digit as 9,
+# and any other character by its code (like U+FB01). Dates and numbers are
+# shown as shapes (9999-99-99) and differences (+3600 s), never as values.
 #
-# HOW TO RUN (a NEW notebook, 4 cells, in the same workspace as the pipeline):
-#   CELL 1 (its own cell, must be the FIRST cell):
-#       %%configure -f
-#       {
-#           "conf": {
-#               "spark.native.enabled": "true"
-#           }
-#       }
-#   CELL 2:  %run MERGE_NB        (the same MERGE notebook the pipeline uses)
-#   CELL 3:  %run CONFIG_NB       (the same CONFIG notebook the pipeline uses)
-#   CELL 4:  this file, from the line "GROUP = 3" down.
-# Run it in the daytime, NOT while the nightly pipeline or a Clarity load
-# runs (the data must not change between the two runs of a query).
-# Each group fits easily in one session. Start with GROUP = 3 (NOTES_C, where
-# native should help most), send the whole output of cell 4, then GROUP = 4,
-# 2 and 1 (change GROUP and run cell 4 again; same session is fine):
-#   1 = the 20 light pipelines (~1 h)   2 = LABS, LABS_POP, FLWSHT (~1-1.5 h)
-#   3 = NOTES_C (~1 h)                  4 = MEDS (~1.5-2 h)
+# How: it runs the source query once with the native engine and once with
+# normal Spark and keeps both results in the Spark cache (NOTES_C: about
+# 20 GB each, memory + disk). Then, with normal Spark only, it pairs the rows
+# on KEY_COLS and compares every column exactly as MERGE puts it into
+# ROW_HASH: coalesce(cast(col as string), '').
+#
+# HOW TO RUN
+#   Same session as CHECK_NATIVE_ENGINE (MERGE_NB and CONFIG_NB already run):
+#     add a new cell with this file, from the line "PIPELINE = ..." down.
+#   New session:
+#     CELL 1:  %run MERGE_NB
+#     CELL 2:  %run CONFIG_NB
+#     CELL 3:  this file, from the line "PIPELINE = ..." down.
+# NOTES_C: about 45 minutes. Not during the pipeline or a Clarity load.
+# Send the whole output of the cell.
 # ============================================================================
 
-GROUP = 3
+PIPELINE = "TBL_ALLERGY_NOTES_C"
+KEY_COLS = ["NOTE_ID", "NOTE_CSN_ID"]   # columns that identify a row
+MAX_ANALYSED = 300                      # differing rows looked at, per column (top 5 columns)
 
+import math
+import re
 import time
+from collections import Counter, defaultdict
+from datetime import datetime
+from functools import reduce
+from pyspark import StorageLevel
 from pyspark.sql import functions as F
 
-_GROUPS = {
-    2: ["TBL_ALLERGY_LABS", "TBL_ALLERGY_LABS_POP", "TBL_ALLERGY_FLWSHT"],
-    3: ["TBL_ALLERGY_NOTES_C"],
-    4: ["TBL_ALLERGY_MEDS"],
-}
-_heavy = {n for names in _GROUPS.values() for n in names}
-if GROUP == 1:
-    _names = [c["pipeline_name"] for c in pipeline_configs if c["pipeline_name"] not in _heavy]
-else:
-    _names = _GROUPS[GROUP]
-_by_name = {c["pipeline_name"]: c for c in pipeline_configs}
+for _needed, _cell in (("configure_spark_for_efficiency", "%run MERGE_NB"),
+                       ("_sync_spec", "%run MERGE_NB"),
+                       ("pipeline_configs", "%run CONFIG_NB")):
+    if _needed not in globals():
+        raise RuntimeError(f"'{_needed}' is not defined: run '{_cell}' in this session first")
 
 configure_spark_for_efficiency()          # the same Spark settings as a pipeline run
 
 
-def _hash_exprs(cfg):
-    spec = _sync_spec(cfg["target_table"], cfg.get("primary_keys", ""),
-                      cfg.get("non_key_columns", ""), cfg.get("identity_column"))
-    cols = [c for c in spec["allColsList"] if c != spec["identityLower"]]
-    all_cols = ", ".join(f"coalesce(cast({c} as string), '')" for c in cols)
-    return spec["rowHashExpr"], f"sha2(concat_ws('||', {all_cols}), 256)"
+def _set_native(on):
+    spark.conf.set("spark.native.enabled", "true" if on else "false")
 
 
 def _native_ops(df):
@@ -71,53 +62,228 @@ def _native_ops(df):
         return -1
 
 
-def _fingerprint(cfg, native):
-    spark.conf.set("spark.native.enabled", "true" if native else "false")
-    row_hash, all_hash = _hash_exprs(cfg)
-    df = (spark.sql(cfg["source_query"])
-          .selectExpr(f"{row_hash} AS rh", f"{all_hash} AS ah")
-          .agg(F.count(F.lit(1)).alias("n"),
-               F.expr("bit_xor(xxhash64(rh))").alias("rh_x"),
-               F.expr("sum(cast(conv(substr(rh, 1, 7), 16, 10) AS BIGINT))").alias("rh_s"),
-               F.expr("bit_xor(xxhash64(ah))").alias("ah_x"),
-               F.expr("sum(cast(conv(substr(ah, 1, 7), 16, 10) AS BIGINT))").alias("ah_s")))
-    t = time.time()
-    r = df.collect()[0]
-    return tuple(r), (time.time() - t) / 60, _native_ops(df)
+def _mask(s):
+    # letters and digits hidden; every other character shown by its code
+    out = []
+    for ch in s:
+        if "A" <= ch <= "Z":
+            out.append("A")
+        elif "a" <= ch <= "z":
+            out.append("a")
+        elif "0" <= ch <= "9":
+            out.append("9")
+        else:
+            out.append(f"U+{ord(ch):04X}" + (f" '{ch}'" if ch.isprintable() and not ch.isspace() else ""))
+    return " ".join(out) or "(end)"
 
 
-try:
-    _native_start = spark.conf.get("spark.native.enabled")
-except Exception:
-    _native_start = "not set"
-print(f"GROUP {GROUP}: {len(_names)} pipelines | Spark {spark.version} | "
-      f"native at start: {_native_start}", flush=True)
-_results = []
-for name in _names:
-    cfg = _by_name[name]
+def _shape(s):
+    return re.sub(r"[0-9]", "9", s)
+
+
+def _ts(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _num(s):
     try:
-        fp_on, min_on, ops_on = _fingerprint(cfg, True)
-        fp_off, min_off, ops_off = _fingerprint(cfg, False)
-        same = fp_on == fp_off
-        _results.append((name, same, min_on, min_off, ops_on))
-        print(f"{name}: {'SAME' if same else 'DIFFERENT'} | rows {fp_on[0]:,} vs {fp_off[0]:,} | "
-              f"native {min_on:.1f} min vs normal {min_off:.1f} min | native operators {ops_on} vs {ops_off}",
-              flush=True)
-        if not same:
-            print(f"   native: {fp_on}\n   normal: {fp_off}", flush=True)
-    except Exception as e:
-        _results.append((name, None, 0, 0, 0))
-        print(f"{name}: ERROR {type(e).__name__}: {str(e)[:300]}", flush=True)
-spark.conf.set("spark.native.enabled", "true")
+        return float(s)
+    except ValueError:
+        return None
 
-_ok = [r for r in _results if r[1] is True]
-_bad = [r[0] for r in _results if r[1] is False]
-_err = [r[0] for r in _results if r[1] is None]
-print("=" * 70)
-print(f"SAME {len(_ok)} | DIFFERENT {len(_bad)} {_bad} | ERROR {len(_err)} {_err}")
-if _ok:
-    print(f"source queries: native {sum(r[2] for r in _ok):.1f} min vs normal {sum(r[3] for r in _ok):.1f} min "
-          f"(native ran first, so the normal runs had the warmer file cache)")
-if any(r[4] == 0 for r in _ok):
-    print("WARNING: some 'native' runs had no native operators, so the engine was not really on. "
-          "Check that cell 1 (%%configure) is the first cell and ran.")
+
+def _num_tag(a, b):
+    fa, fb = _num(a), _num(b)
+    if fa is None or fb is None:
+        return "not a number"
+    if fa == fb:
+        return "same number, written differently"
+    try:
+        return f"different number, relative difference ~1e{math.floor(math.log10(abs(fb - fa) / abs(fa)))}"
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return "different number"
+
+
+def _kind(a, b, typ):
+    # a = normal Spark, b = native; returns a description without any value
+    if typ == "string":
+        m = min(len(a), len(b))
+        p = next((k for k in range(m) if a[k] != b[k]), m)
+        where = "at start" if p == 0 else ("at end" if p == m else "in middle")
+        ma, mb = _mask(a[p:p + 3]), _mask(b[p:p + 3])
+        return f"{where}: normal {ma}  |  native {mb}" + ("  (other letters or digits)" if ma == mb else "")
+    shapes = "same shape" if _shape(a) == _shape(b) else f"normal '{_shape(a)}'  |  native '{_shape(b)}'"
+    if typ.startswith("timestamp") or typ == "date":
+        ta, tb = _ts(a), _ts(b)
+        return f"{shapes}  |  " + (f"native - normal = {(tb - ta).total_seconds():+g} s"
+                                   if ta and tb else "not a date")
+    if typ in ("double", "float", "int", "bigint", "smallint", "tinyint") or typ.startswith("decimal"):
+        return f"{shapes}  |  {_num_tag(a, b)}"
+    return shapes
+
+
+def _len_bucket(d):
+    return "0" if d == 0 else (f"{d:+d}" if abs(d) <= 3 else ("more than +3" if d > 0 else "less than -3"))
+
+
+def _run(cached):
+    t0 = time.time()
+    cfg = {c["pipeline_name"]: c for c in pipeline_configs}[PIPELINE]
+    q = cfg["source_query"]
+    spec = _sync_spec(cfg["target_table"], cfg.get("primary_keys", ""),
+                      cfg.get("non_key_columns", ""), cfg.get("identity_column"))
+    _set_native(False)
+    plain = spark.sql(q)                  # only resolves names and types, runs nothing
+    by_lower = {c.lower(): c for c in plain.columns}
+    types = dict(plain.dtypes)
+    cols = [by_lower[c] for c in spec["allColsList"] if c != spec["identityLower"] and c in by_lower]
+    missing = [k for k in KEY_COLS if k.lower() not in by_lower]
+    if missing:
+        raise ValueError(f"KEY_COLS {missing} are not columns of the {PIPELINE} source query")
+    keys = [by_lower[k.lower()] for k in KEY_COLS]
+    hash_cols = spec["pkList"] or [c for c in spec["allColsList"] if c != spec["identityLower"]]
+    hash_idx = [cols.index(by_lower[c]) for c in hash_cols]     # ROW_HASH columns, in MERGE's order
+    kc = [f"__k{j}" for j in range(len(keys))]
+    sc = [f"__s{i}" for i in range(len(cols))]
+
+    def strings(df, with_rh):
+        out = [F.col(k).alias(x) for k, x in zip(keys, kc)]         # keys as they are, no cast
+        out += [F.coalesce(F.col(c).cast("string"), F.lit("")).alias(s) for c, s in zip(cols, sc)]
+        if with_rh:   # ROW_HASH as MERGE computes it (also keeps the two caches apart)
+            out.append(F.expr(spec["rowHashExpr"]).alias("__rh"))
+        return df.select(*out)
+
+    print(f"CHECK_NATIVE_DIFF {PIPELINE} | Spark {spark.version} | keys {', '.join(keys)} | "
+          f"{len(cols)} columns", flush=True)
+
+    # 1) native engine first (if it fails, it fails early); the cache keeps its result as it made it
+    _set_native(True)
+    t = time.time()
+    n = strings(spark.sql(q), True).persist(StorageLevel.MEMORY_AND_DISK)
+    cached.append(n)
+    nn = n.count()
+    ops = _native_ops(n)
+    _set_native(False)
+    print(f"native engine: {nn:,} rows in {(time.time() - t) / 60:.1f} min | native operators {ops}",
+          flush=True)
+    if ops == 0:
+        raise RuntimeError("the native run had no native operators, so the native engine did not "
+                           "really run and a comparison would mean nothing. Send this output.")
+
+    # 2) normal Spark (native is OFF from here on)
+    t = time.time()
+    v = strings(spark.sql(q), False).persist(StorageLevel.MEMORY_AND_DISK)
+    cached.append(v)
+    nv = v.count()
+    print(f"normal Spark : {nv:,} rows in {(time.time() - t) / 60:.1f} min", flush=True)
+
+    # 3) compare: pair rows on the keys; one 64-bit hash per column, made here by normal Spark
+    #    from the cached values of each side (so only small hashes are shuffled)
+    t = time.time()
+    dup_n = n.groupBy(*kc).count().filter("count > 1").count()
+    dup_v = v.groupBy(*kc).count().filter("count > 1").count()
+
+    def hashed(df, side):
+        return df.select(*[F.col(k).alias(side + k) for k in kc],
+                         *[F.xxhash64(F.col(s)).alias(f"{side}h{i}") for i, s in enumerate(sc)])
+
+    j = hashed(v, "v").join(hashed(n, "n"), [F.col("v" + k).eqNullSafe(F.col("n" + k)) for k in kc],
+                            "full_outer")
+    in_v, in_n = F.col("vh0").isNotNull(), F.col("nh0").isNotNull()
+    flags = [F.coalesce(F.col(f"vh{i}") != F.col(f"nh{i}"), F.lit(False)) for i in range(len(cols))]
+    d = (j.filter(~(in_v & in_n) | reduce(lambda x, y: x | y, flags))
+          .select(*[F.coalesce(F.col("v" + k), F.col("n" + k)).alias(k) for k in kc],
+                  in_v.alias("in_v"), in_n.alias("in_n"),
+                  *[f.alias(f"d{i}") for i, f in enumerate(flags)])
+          .persist(StorageLevel.MEMORY_AND_DISK))
+    cached.append(d)
+    aggs = [F.count(F.when(F.col("in_v") & ~F.col("in_n"), 1)).alias("only_v"),
+            F.count(F.when(F.col("in_n") & ~F.col("in_v"), 1)).alias("only_n"),
+            F.count(F.when(F.col("in_v") & F.col("in_n"), 1)).alias("any_diff")]
+    aggs += [F.count(F.when(F.col(f"d{i}"), 1)).alias(f"c{i}") for i in range(len(cols))]
+    r = d.agg(*aggs).collect()[0]
+    print(f"compare: {(time.time() - t) / 60:.1f} min", flush=True)
+    print(f"keys only in native: {r['only_n']:,} | only in normal: {r['only_v']:,} | "
+          f"duplicate keys: native {dup_n:,}, normal {dup_v:,}", flush=True)
+    if dup_n or dup_v:
+        print("   (a duplicate key pairs its rows more than once, so some differences below are not real)",
+              flush=True)
+    print(f"rows (same key) with at least one column different: {r['any_diff']:,} of {min(nn, nv):,}",
+          flush=True)
+    bad = sorted([(i, r[f"c{i}"]) for i in range(len(cols)) if r[f"c{i}"] > 0], key=lambda x: -x[1])
+    for i, cnt in bad:
+        print(f"   {cols[i]} ({types[cols[i]]}): {cnt:,} rows", flush=True)
+
+    # 4) is the hash function itself the same? normal Spark's ROW_HASH of the native values
+    #    against the ROW_HASH that the native engine computed
+    rh_v = F.sha2(F.concat_ws("||", *[F.col(sc[i]) for i in hash_idx]), 256)
+    rh_bad = n.filter(~rh_v.eqNullSafe(F.col("__rh"))).count()
+    print(f"hash check: native ROW_HASH differs from normal Spark's ROW_HASH of the same values in "
+          f"{rh_bad:,} rows" + (" (so the hash function is not the cause)" if rh_bad == 0 else ""),
+          flush=True)
+
+    # 5) what kind of difference: up to MAX_ANALYSED differing rows of each of the top 5 columns
+    top = [i for i, _ in bad[:5]]
+    if top:
+        ks = (reduce(lambda x, y: x.unionByName(y),
+                     [d.filter(F.col(f"d{i}")).select(*kc, *[f"d{t_}" for t_ in top]).limit(MAX_ANALYSED)
+                      for i in top])
+              .dropDuplicates(kc)
+              .persist(StorageLevel.MEMORY_AND_DISK))
+        cached.append(ks)
+        spark_flags = {tuple(x[k] for k in kc): x for x in ks.collect()}
+        kq = ks.select(*[F.col(k).alias(f"q{jj}") for jj, k in enumerate(kc)])
+
+        def fetch(df):
+            cond = [F.col(k).eqNullSafe(F.col(f"q{jj}")) for jj, k in enumerate(kc)]
+            out = defaultdict(list)
+            for x in df.join(F.broadcast(kq), cond, "left_semi").select(*kc, *[sc[i] for i in top]).collect():
+                out[tuple(x[k] for k in kc)].append(x)
+            return out
+
+        fv, fn = fetch(v), fetch(n)
+        print("kinds of difference (normal = normal Spark, native = native engine; "
+              "A = letter A-Z, a = letter a-z, 9 = digit, others by code):", flush=True)
+        for i in top:
+            kinds, lens = Counter(), Counter()
+            looked = skipped = 0
+            for key, fl in spark_flags.items():
+                if looked >= MAX_ANALYSED:
+                    break
+                if not fl[f"d{i}"]:
+                    continue
+                rv, rn = fv.get(key, []), fn.get(key, [])
+                if len(rv) != 1 or len(rn) != 1:
+                    skipped += 1
+                    continue
+                a, b = rv[0][sc[i]], rn[0][sc[i]]
+                looked += 1
+                if a == b:
+                    kinds["Spark sees a difference, Python does not (bytes that are not valid UTF-8?)"] += 1
+                    continue
+                kinds[_kind(a, b, types[cols[i]])] += 1
+                lens[_len_bucket(len(b) - len(a))] += 1
+            print(f"{cols[i]} ({types[cols[i]]}): {looked} differing rows looked at"
+                  + (f", {skipped} skipped (duplicate key)" if skipped else ""), flush=True)
+            for k_, cnt in kinds.most_common(15):
+                print(f"   {cnt:>5}  {k_}", flush=True)
+            if len(kinds) > 15:
+                print(f"   ... and {len(kinds) - 15} more kinds", flush=True)
+            if lens:
+                print(f"   length, native minus normal: {dict(lens.most_common(8))}", flush=True)
+    print(f"done in {(time.time() - t0) / 60:.0f} min", flush=True)
+
+
+_cached = []
+try:
+    _run(_cached)
+finally:
+    for _df in _cached:
+        _df.unpersist()
+    _set_native(False)
+    print("(caches freed, native left OFF for this session)", flush=True)
