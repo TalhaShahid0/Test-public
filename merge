@@ -1,5 +1,5 @@
 # ============================================================================
-# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v4: faster)
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v5: faster)
 # ============================================================================
 #
 # SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
@@ -88,6 +88,30 @@
 #      cached data the Spark session holds (in memory / on disk) and how
 #      many executors and cores it has.
 #
+# v5 CHANGES (same rows as v4, same surrogate-key formula):
+#
+#  16. Mode A on a target that already has active rows (every normal
+#      incremental run): the source is no longer kept as a whole. v4 cached
+#      every source row with every column (MEDS: 318M rows, about 46 GB, much
+#      of it spilled to disk) only to compare it with the target once. Now the
+#      target's latest versions are read first, and the source query runs ONCE,
+#      straight into the same full outer join on the hash (same conditions as
+#      v4). What is kept is only what the next steps need: the full rows to
+#      insert, the hashes to soft-delete, and for every other source row just
+#      its partition number and position (a few bytes), so the per-partition
+#      counts and the key formula of v4 still apply.
+#  17. Keys: exactly the v4 formula, max key + rows in earlier partitions +
+#      position in its partition + 1, over ALL source rows (max+1..max+N), so
+#      the inserted rows get keys the way v4 gives them.
+#  18. First load (no target), and a target with no active row (empty, or
+#      everything soft-deleted), keep the v4 path: there every source row is
+#      inserted anyway. _MODE_A_ONE_PASS = False switches v5 back to v4.
+#  19. Step times (printing only), mode A one pass: "max key in target",
+#      "target latest versions" (now first), "source query + compare with
+#      target" (the one pass), then the append step as before. "Source Record
+#      Count" is printed after the pass, then a second "[info]" line (cached
+#      data after the pass: it should be small).
+#
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
 # {
@@ -139,6 +163,10 @@ SYSTEM_COLS = {"is_deleted", "row_hash", "dw_updated_at", "batch_id",
                "payload_hash", "entity_key"}
 
 _PERSIST = StorageLevel.MEMORY_AND_DISK   # spill to disk instead of evicting
+
+# v5 (header 16): mode A compares the source with the target in one pass,
+# without keeping the whole source. False = exactly the v4 behaviour.
+_MODE_A_ONE_PASS = True
 
 # Internal I/U/D tag added to the rows being appended. Deliberately an
 # unlikely name so it can never collide with a business column (a real column
@@ -307,7 +335,7 @@ def _sync_spec(targetTable, primaryKeys, nonKeyColumns, identityColumn):
 # ============================================================================
 
 def _stage_source(source_query, target_table, row_hash_expr=None,
-                  with_row_ids=False, view_prefix="_src_"):
+                  with_row_ids=False, view_prefix="_src_", persist=True):
     """
     Evaluate the (expensive) source query once and keep it (MEMORY_AND_DISK).
     With row_hash_expr the hash is computed here, once, into RH_COL and the
@@ -316,6 +344,7 @@ def _stage_source(source_query, target_table, row_hash_expr=None,
     this also spreads a skewed source evenly (the reason the old version
     repartitioned before caching -- exit code 137).
     with_row_ids adds PID_COL / MID_COL (frozen in the cache) for mode A keys.
+    persist=False (v5, header 16): not kept; the caller decides.
     """
     df = spark.sql(source_query)
     n = _num_partitions()
@@ -328,7 +357,8 @@ def _stage_source(source_query, target_table, row_hash_expr=None,
             df.withColumn(PID_COL, spark_partition_id())
               .withColumn(MID_COL, monotonically_increasing_id())
         )
-    df = df.persist(_PERSIST)
+    if persist:
+        df = df.persist(_PERSIST)
     view = _safe_name(view_prefix, target_table)
     df.createOrReplaceTempView(view)
     return f"SELECT * FROM {view}", view, df
@@ -842,6 +872,176 @@ def deltaUpsertAndSync(
 
 
 # ============================================================================
+# v5 (header 16): mode A in one pass, without keeping the whole source
+# ============================================================================
+
+def _latest_with_counts(target_table):
+    """Narrow latest versions (persisted) + their total and active counts."""
+    latest_df = _latest_target_narrow(target_table)
+    lc = latest_df.agg(
+        spark_count(lit(1)).alias("n"),
+        spark_sum(when(coalesce(col("is_deleted"), lit(0)) == 0, 1)
+                  .otherwise(0)).alias("active"),
+    ).collect()[0]
+    return latest_df, lc["n"], lc["active"] or 0
+
+
+def _sync_mode_a_one_pass(target_table, spec, src_df, latest_df, latest_count,
+                          before_active, identity_column, max_key, batch_id,
+                          temp_views, cached_dfs):
+    """
+    Mode A sync with the same rows as deltaUpsertAndSync (v4, narrow path):
+      I = source row whose hash has no active latest version
+          (tgt.row_hash IS NULL OR tgt.is_deleted = 1)
+      D = latest version with is_deleted = 0 whose hash is not in the source,
+          read back from the target (latest version of that hash)
+    src_df is NOT cached: the source query runs once, straight into the join.
+    Kept (persisted) per source row: its kind (I = insert, M = already in the
+    target), its partition id and monotonically_increasing_id (for the v4 key
+    formula); the full row only for I rows, and for D the hash.
+    Returns (result dict like deltaUpsertAndSync, source_count).
+    """
+    ident = spec["identityLower"]
+    biz = [c for c in spec["allColsList"] if c != ident]
+    insert_cols = ", ".join(spec["insertColsList"])
+    batch_lit = "CAST(NULL AS BIGINT)" if batch_id is None else str(batch_id)
+    with_keys = bool(identity_column)
+
+    src_view = _safe_name("_syncsrc_", target_table)
+    latest_view = _safe_name("_latest_", target_table)
+    diff_view = _safe_name("_diff_", target_table)
+    del_view = _safe_name("_delh_", target_table)
+    changes_view = _safe_name("_chg_", target_table)
+    src_df.createOrReplaceTempView(src_view)
+    latest_df.createOrReplaceTempView(latest_view)
+    temp_views += [src_view, latest_view, diff_view, del_view, changes_view]
+
+    print(f"Running sync for target table: {target_table} [full-row-hash mode]...")
+    # Hash join while the target side (the side kept in memory) is small enough
+    # per partition (v3.1 header 11); the source side is only streamed.
+    n_parts = max(_num_partitions(), 1)
+    hint = ("/*+ SHUFFLE_HASH(tgt) */"
+            if latest_count / n_parts <= _HASH_JOIN_MAX_ROWS_PER_PARTITION else "")
+    ids = f"src.{PID_COL} AS {PID_COL}, src.{MID_COL} AS {MID_COL}," if with_keys else ""
+    payload = ", ".join(f"'{c}', src.`{c}`" for c in biz)
+    diff_df = spark.sql(f"""
+    SELECT * FROM (
+        SELECT {hint}
+            CASE WHEN src.__sync_src__ IS NULL
+                     THEN CASE WHEN tgt.is_deleted = 0 THEN 'D' END
+                 WHEN tgt.row_hash IS NULL OR tgt.is_deleted = 1 THEN 'I'
+                 ELSE 'M' END AS __sync_kind__,
+            {ids}
+            CASE WHEN src.__sync_src__ IS NULL OR tgt.row_hash IS NULL OR tgt.is_deleted = 1
+                 THEN named_struct({payload}, '{RH_COL}', coalesce(src.{RH_COL}, tgt.row_hash))
+            END AS __sync_p__
+        FROM (SELECT *, true AS __sync_src__ FROM {src_view}) src
+        FULL OUTER JOIN {latest_view} tgt
+            ON src.{RH_COL} = tgt.row_hash
+    ) d
+    WHERE __sync_kind__ IS NOT NULL
+    """).persist(_PERSIST)
+    cached_dfs.append(diff_df)
+    diff_df.createOrReplaceTempView(diff_view)
+
+    grp = ["__sync_kind__", PID_COL] if with_keys else ["__sync_kind__"]
+    agg = diff_df.groupBy(*grp).count().collect()
+    n_ins = sum(r["count"] for r in agg if r["__sync_kind__"] == "I")
+    n_del = sum(r["count"] for r in agg if r["__sync_kind__"] == "D")
+    source_count = sum(r["count"] for r in agg if r["__sync_kind__"] in ("I", "M"))
+    print("Source Record Count:", source_count)
+    _step("source query + compare with target")
+    if getattr(_STEP_CLOCK, "t0", None) is not None:
+        print(f"   [info] {_session_info()}", flush=True)
+
+    key_sql = ""
+    if with_keys:
+        # The v4 formula (_mode_a_keyed): max_key + rows of the source in the
+        # partitions before this one + position in this partition + 1.
+        counts = {}
+        for r in agg:
+            if r["__sync_kind__"] in ("I", "M"):
+                counts[r[PID_COL]] = counts.get(r[PID_COL], 0) + r["count"]
+        n_p = (max(counts) + 1) if counts else 1
+        offsets, run = [], 0
+        for p in range(n_p):
+            offsets.append(run)
+            run += counts.get(p, 0)
+        offs = "array(" + ", ".join(f"{o}L" for o in offsets) + ")"
+        key_sql = (
+            f"CAST({int(max_key)} AS BIGINT) "
+            f"+ element_at({offs}, {PID_COL} + 1) "
+            f"+ ({MID_COL} - CAST({PID_COL} AS BIGINT) * {1 << 33}L) + 1L AS {ident},"
+        )
+
+    sel = ", ".join(f"__sync_p__.`{c}` AS {c}" for c in biz)
+    ins_df = spark.sql(f"""
+    SELECT
+        {sel},
+        {key_sql}
+        __sync_p__.`{RH_COL}` AS row_hash,
+        0 AS is_deleted,
+        current_timestamp() AS dw_updated_at,
+        {batch_lit} AS batch_id,
+        'I' AS {CHG_TAG}
+    FROM {diff_view}
+    WHERE __sync_kind__ = 'I'
+    """)
+    if n_del > 0:
+        # Exactly the v4 read-back of the rows to soft-delete.
+        del_hashes = spark.sql(
+            f"SELECT __sync_p__.`{RH_COL}` AS row_hash FROM {diff_view} "
+            f"WHERE __sync_kind__ = 'D'"
+        )
+        del_hashes.createOrReplaceTempView(del_view)
+        hint = "/*+ BROADCAST(d) */" if n_del <= _BROADCAST_DELETE_ROWS else ""
+        del_cols = ", ".join(f"t.{c} AS {c}" for c in spec["allColsList"])
+        del_df = spark.sql(f"""
+    SELECT
+        {del_cols},
+        t.row_hash AS row_hash,
+        1 AS is_deleted,
+        current_timestamp() AS dw_updated_at,
+        {batch_lit} AS batch_id,
+        'D' AS {CHG_TAG}
+    FROM (
+        SELECT {hint} x.*,
+               ROW_NUMBER() OVER (PARTITION BY x.row_hash
+                                  ORDER BY x.dw_updated_at DESC, x.batch_id DESC) AS __sync_rn__
+        FROM {target_table} x
+        LEFT SEMI JOIN {del_view} d
+            ON x.row_hash <=> d.row_hash
+    ) t
+    WHERE t.__sync_rn__ = 1
+    """)
+        changes = ins_df.unionByName(del_df)
+    else:
+        changes = ins_df
+
+    if n_ins + n_del > 0:
+        # One query, so I and D rows share one dw_updated_at (as in v4).
+        changes.createOrReplaceTempView(changes_view)
+        spark.sql(
+            f"INSERT INTO {target_table} ({insert_cols}) "
+            f"SELECT {insert_cols} FROM {changes_view}"
+        )
+        _step("soft-delete rows read back + append to target"
+              if n_del > 0 else "append to target")
+    else:
+        print("   No changes detected; nothing appended.")
+
+    print("   --> Success!")
+    print("-" * 75)
+    return {
+        "inserted": n_ins,
+        "updated": 0,
+        "deleted": n_del,
+        "before_active": before_active,
+        "after_active": before_active + n_ins - n_del,
+    }, source_count
+
+
+# ============================================================================
 # Generic Batch Control Table Schema
 # ============================================================================
 
@@ -1105,11 +1305,18 @@ def run_batch_tracked_merge(
 
         # ---- Step 3a: stage the source ONCE (row_hash computed here) --------
         mode_a_keys = bool(identity_column) and not pk_cols
+        # v5 (header 16): mode A on an existing target may run in one pass;
+        # then the staged source is not kept (decided below, header 18).
+        one_pass_candidate = (
+            not pk_cols and _MODE_A_ONE_PASS and spark.catalog.tableExists(target_table)
+        )
         staged_query, src_view, src_df = _stage_source(
-            source_query, target_table, spec["rowHashExpr"], with_row_ids=mode_a_keys
+            source_query, target_table, spec["rowHashExpr"], with_row_ids=mode_a_keys,
+            persist=not one_pass_candidate,
         )
         temp_views.append(src_view)
-        cached_dfs.append(src_df)
+        if not one_pass_candidate:
+            cached_dfs.append(src_df)
         business_cols = [c for c in src_df.columns if c not in _INTERNAL_COLS]
 
         # ---- Step 3b: validate key, surrogate keys, create target -----------
@@ -1145,7 +1352,7 @@ def run_batch_tracked_merge(
 
             if not pk_cols:
                 # ---- Mode A: every source row gets max+1..max+N -------------
-                sync_df, source_count = _mode_a_keyed(src_df, identity_column, max_key)
+                # (v5: computed below, in the one pass or as in v4)
                 schema_df = src_df.select(
                     *business_cols, lit(None).cast("bigint").alias(identity_column)
                 )
@@ -1160,6 +1367,25 @@ def run_batch_tracked_merge(
                     *[c for c in business_cols if c not in resolved_pks],
                     lit(None).cast("bigint").alias(identity_column),
                 )
+
+        # ---- v5 (header 16/18): one pass, or the v4 path ---------------------
+        one_pass = False
+        latest_df = None
+        if one_pass_candidate:
+            latest_df, latest_count, before_active = _latest_with_counts(target_table)
+            cached_dfs.append(latest_df)
+            _step("target latest versions")
+            print(f"   [info] {_session_info()}", flush=True)
+            one_pass = before_active > 0
+            if not one_pass:
+                # every source row will be inserted: keep it, as v4 does
+                print("   [info] target has no active row: every source row is "
+                      "inserted (v4 path)", flush=True)
+                src_df = src_df.persist(_PERSIST)
+                cached_dfs.append(src_df)
+                sync_df = src_df
+        if mode_a_keys and not one_pass:
+            sync_df, source_count = _mode_a_keyed(src_df, identity_column, max_key)
 
         # Declared columns must cover the source query (a column-list INSERT
         # silently NULL-fills anything omitted).
@@ -1178,29 +1404,38 @@ def run_batch_tracked_merge(
 
         _create_target_table_if_missing(target_table, schema_df=schema_df)
 
-        # ---- Step 4: source count (cached, so cheap) ------------------------
-        if source_count is None:
-            source_count = src_df.count()
-        print("Source Record Count:", source_count)
-        _step("source query + staging")
+        if one_pass:
+            # ---- Steps 4+5 (v5, header 16): source query + diff in one pass --
+            result, source_count = _sync_mode_a_one_pass(
+                target_table, spec, src_df, latest_df, latest_count, before_active,
+                identity_column, max_key if identity_column else 0, batch_id,
+                temp_views, cached_dfs,
+            )
+        else:
+            # ---- Step 4: source count (cached, so cheap) --------------------
+            if source_count is None:
+                source_count = src_df.count()
+            print("Source Record Count:", source_count)
+            _step("source query + staging")
 
-        # ---- Step 5: execute the sync ---------------------------------------
-        latest_df = (_latest_target_df(target_table) if pk_cols
-                     else _latest_target_narrow(target_table))      # v3, header 10
-        cached_dfs.append(latest_df)
+            # ---- Step 5: execute the sync -----------------------------------
+            if latest_df is None:
+                latest_df = (_latest_target_df(target_table) if pk_cols
+                             else _latest_target_narrow(target_table))  # v3, header 10
+                cached_dfs.append(latest_df)
 
-        result = deltaUpsertAndSync(
-            targetTable=target_table,
-            sourceQuery=None,
-            primaryKeys=primary_keys,
-            nonKeyColumns=effective_non_key_columns,
-            identityColumn=identity_column,
-            batchId=batch_id,
-            latestDf=latest_df,
-            stagedDf=sync_df,
-            keyLookup=key_lookup,
-            sourceCount=source_count,       # v4, header 14
-        )
+            result = deltaUpsertAndSync(
+                targetTable=target_table,
+                sourceQuery=None,
+                primaryKeys=primary_keys,
+                nonKeyColumns=effective_non_key_columns,
+                identityColumn=identity_column,
+                batchId=batch_id,
+                latestDf=latest_df,
+                stagedDf=sync_df,
+                keyLookup=key_lookup,
+                sourceCount=source_count,       # v4, header 14
+            )
 
         inserted_count = result["inserted"]
         updated_count = result["updated"]
