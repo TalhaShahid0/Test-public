@@ -1,5 +1,5 @@
 # ============================================================================
-# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v5: faster)
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v5.1: faster)
 # ============================================================================
 #
 # SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
@@ -112,6 +112,19 @@
 #      Count" is printed after the pass, then a second "[info]" line (cached
 #      data after the pass: it should be small).
 #
+# v5.1 CHANGE (same rows and same keys as v5):
+#
+#  20. First load in mode A (the target is new, or has no row at all): there
+#      is no target row, so every source row is an I row and there is no D
+#      row. v5 (like v4) still joined the staged source with the empty target
+#      and cached the result, a second full copy of the source (MEDS first
+#      load 2026-11-15: "compare with target" 29.5 min, then the append read
+#      that copy back: 43.7 min). Now the append reads the staged source
+#      directly: the same rows, and the same keys (same formula on the same
+#      staged copy), without the second copy. A target that has rows, even if
+#      all are soft-deleted, keeps the v5 path. _FIRST_LOAD_DIRECT = False
+#      switches this off (exactly v5).
+#
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
 # {
@@ -167,6 +180,10 @@ _PERSIST = StorageLevel.MEMORY_AND_DISK   # spill to disk instead of evicting
 # v5 (header 16): mode A compares the source with the target in one pass,
 # without keeping the whole source. False = exactly the v4 behaviour.
 _MODE_A_ONE_PASS = True
+
+# v5.1 (header 20): a first load in mode A appends the staged source directly
+# (no join with the empty target, no second copy). False = exactly v5.
+_FIRST_LOAD_DIRECT = True
 
 # Internal I/U/D tag added to the rows being appended. Deliberately an
 # unlikely name so it can never collide with a business column (a real column
@@ -695,40 +712,13 @@ def deltaUpsertAndSync(
                 <= _HASH_JOIN_MAX_ROWS_PER_PARTITION
             )
             hint = "/*+ SHUFFLE_HASH(tgt) */" if hash_join else ""
-            # v4 (header 13): ONE pass finds both kinds of rows, with the
-            # conditions of the two v3.1 joins:
-            #   I: source row, and its hash has no latest version or the
-            #      latest version is soft-deleted (v3.1: LEFT JOIN, WHERE
-            #      tgt.row_hash IS NULL OR tgt.is_deleted = 1)
-            #   D: latest version with is_deleted = 0 whose hash no source row
-            #      has (v3.1: LEFT ANTI JOIN, WHERE tgt.is_deleted = 0)
-            # __sync_src__ marks the source side (NULL = no source row).
-            diff_cols = ", ".join(f"src.{c} AS {c}" for c in allColsList)
-            diff_df = spark.sql(f"""
-    SELECT {hint}
-        {diff_cols},
-        src.{RH_COL} AS {RH_COL},
-        tgt.row_hash AS __sync_tgt_rh__,
-        CASE WHEN src.__sync_src__ IS NULL THEN 'D' ELSE 'I' END AS __sync_kind__
-    FROM (SELECT *, true AS __sync_src__ FROM {src_view}) src
-    FULL OUTER JOIN {latest_view} tgt
-        ON src.{RH_COL} = tgt.row_hash
-    WHERE (src.__sync_src__ IS NOT NULL
-           AND (tgt.row_hash IS NULL OR tgt.is_deleted = 1))
-       OR (src.__sync_src__ IS NULL AND tgt.is_deleted = 0)
-    """).persist(_PERSIST)
-            cached.append(diff_df)
-            diff_view = _safe_name("_diff_", targetTable)
-            diff_df.createOrReplaceTempView(diff_view)
-            views.append(diff_view)
-            kinds = {
-                r["__sync_kind__"]: r["count"]
-                for r in diff_df.groupBy("__sync_kind__").count().collect()
-            }
-            n_del = kinds.get("D", 0)
-            _step("compare with target")
-            ins_cols = ", ".join(f"{c} AS {c}" for c in allColsList)
-            ins_df = spark.sql(f"""
+            if _FIRST_LOAD_DIRECT and latest_count == 0:
+                # v5.1 (header 20): the target has no row at all, so every
+                # source row is an I row and there is no D row: what the join
+                # below returns, read straight from the staged source (same
+                # rows, same keys, no second copy of the source).
+                ins_cols = ", ".join(f"{c} AS {c}" for c in allColsList)
+                changes_df = spark.sql(f"""
     SELECT
         {ins_cols},
         {RH_COL} AS row_hash,
@@ -736,47 +726,95 @@ def deltaUpsertAndSync(
         current_timestamp() AS dw_updated_at,
         {batchIdLiteral} AS batch_id,
         'I' AS {CHG_TAG}
-    FROM {diff_view}
-    WHERE __sync_kind__ = 'I'
+    FROM {src_view}
     """)
-            if n_del > 0:
-                del_hashes = spark.sql(
-                    f"SELECT __sync_tgt_rh__ AS row_hash FROM {diff_view} "
-                    f"WHERE __sync_kind__ = 'D'"
-                )
-                del_hashes.createOrReplaceTempView(del_view)
-                hint = "/*+ BROADCAST(d) */" if n_del <= _BROADCAST_DELETE_ROWS else ""
-                del_cols = ", ".join(f"t.{c} AS {c}" for c in allColsList)
-                del_df = spark.sql(f"""
-    SELECT
-        {del_cols},
-        t.row_hash AS row_hash,
-        1 AS is_deleted,
-        current_timestamp() AS dw_updated_at,
-        {batchIdLiteral} AS batch_id,
-        'D' AS {CHG_TAG}
-    FROM (
-        SELECT {hint} x.*,
-               ROW_NUMBER() OVER (PARTITION BY x.row_hash
-                                  ORDER BY x.dw_updated_at DESC, x.batch_id DESC) AS __sync_rn__
-        FROM {targetTable} x
-        LEFT SEMI JOIN {del_view} d
-            ON x.row_hash <=> d.row_hash
-    ) t
-    WHERE t.__sync_rn__ = 1
-    """)
-                changes = ins_df.unionByName(del_df)
+                counts = {"I": src_count, "D": 0}
+                print("   [info] target has no row: every source row is new and is "
+                      "appended straight from the staged source", flush=True)
+                _step("compare with target")
             else:
-                changes = ins_df
-            # v4 (header 13): the diff is already kept (diff_df) and counted.
-            # The change set is appended straight from it; the rows to
-            # soft-delete are read back from the target inside the append
-            # (one query, so I and D rows share one dw_updated_at, as in
-            # v3.1). Each D hash gives exactly one D row (ROW_NUMBER = 1), so
-            # the counts are those of the diff. Not caching the change set
-            # again also keeps a first load at two copies of the source.
-            changes_df = changes
-            counts = {"I": kinds.get("I", 0), "D": n_del}
+                # v4 (header 13): ONE pass finds both kinds of rows, with the
+                # conditions of the two v3.1 joins:
+                #   I: source row, and its hash has no latest version or the
+                #      latest version is soft-deleted (v3.1: LEFT JOIN, WHERE
+                #      tgt.row_hash IS NULL OR tgt.is_deleted = 1)
+                #   D: latest version with is_deleted = 0 whose hash no source row
+                #      has (v3.1: LEFT ANTI JOIN, WHERE tgt.is_deleted = 0)
+                # __sync_src__ marks the source side (NULL = no source row).
+                diff_cols = ", ".join(f"src.{c} AS {c}" for c in allColsList)
+                diff_df = spark.sql(f"""
+        SELECT {hint}
+            {diff_cols},
+            src.{RH_COL} AS {RH_COL},
+            tgt.row_hash AS __sync_tgt_rh__,
+            CASE WHEN src.__sync_src__ IS NULL THEN 'D' ELSE 'I' END AS __sync_kind__
+        FROM (SELECT *, true AS __sync_src__ FROM {src_view}) src
+        FULL OUTER JOIN {latest_view} tgt
+            ON src.{RH_COL} = tgt.row_hash
+        WHERE (src.__sync_src__ IS NOT NULL
+               AND (tgt.row_hash IS NULL OR tgt.is_deleted = 1))
+           OR (src.__sync_src__ IS NULL AND tgt.is_deleted = 0)
+        """).persist(_PERSIST)
+                cached.append(diff_df)
+                diff_view = _safe_name("_diff_", targetTable)
+                diff_df.createOrReplaceTempView(diff_view)
+                views.append(diff_view)
+                kinds = {
+                    r["__sync_kind__"]: r["count"]
+                    for r in diff_df.groupBy("__sync_kind__").count().collect()
+                }
+                n_del = kinds.get("D", 0)
+                _step("compare with target")
+                ins_cols = ", ".join(f"{c} AS {c}" for c in allColsList)
+                ins_df = spark.sql(f"""
+        SELECT
+            {ins_cols},
+            {RH_COL} AS row_hash,
+            0 AS is_deleted,
+            current_timestamp() AS dw_updated_at,
+            {batchIdLiteral} AS batch_id,
+            'I' AS {CHG_TAG}
+        FROM {diff_view}
+        WHERE __sync_kind__ = 'I'
+        """)
+                if n_del > 0:
+                    del_hashes = spark.sql(
+                        f"SELECT __sync_tgt_rh__ AS row_hash FROM {diff_view} "
+                        f"WHERE __sync_kind__ = 'D'"
+                    )
+                    del_hashes.createOrReplaceTempView(del_view)
+                    hint = "/*+ BROADCAST(d) */" if n_del <= _BROADCAST_DELETE_ROWS else ""
+                    del_cols = ", ".join(f"t.{c} AS {c}" for c in allColsList)
+                    del_df = spark.sql(f"""
+        SELECT
+            {del_cols},
+            t.row_hash AS row_hash,
+            1 AS is_deleted,
+            current_timestamp() AS dw_updated_at,
+            {batchIdLiteral} AS batch_id,
+            'D' AS {CHG_TAG}
+        FROM (
+            SELECT {hint} x.*,
+                   ROW_NUMBER() OVER (PARTITION BY x.row_hash
+                                      ORDER BY x.dw_updated_at DESC, x.batch_id DESC) AS __sync_rn__
+            FROM {targetTable} x
+            LEFT SEMI JOIN {del_view} d
+                ON x.row_hash <=> d.row_hash
+        ) t
+        WHERE t.__sync_rn__ = 1
+        """)
+                    changes = ins_df.unionByName(del_df)
+                else:
+                    changes = ins_df
+                # v4 (header 13): the diff is already kept (diff_df) and counted.
+                # The change set is appended straight from it; the rows to
+                # soft-delete are read back from the target inside the append
+                # (one query, so I and D rows share one dw_updated_at, as in
+                # v3.1). Each D hash gives exactly one D row (ROW_NUMBER = 1), so
+                # the counts are those of the diff. Not caching the change set
+                # again also keeps a first load at two copies of the source.
+                changes_df = changes
+                counts = {"I": kinds.get("I", 0), "D": n_del}
         else:
             # Upsert rows take the source values, soft-delete rows the target's.
             selCols = []
