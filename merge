@@ -1,5 +1,5 @@
 # ============================================================================
-# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v5.1: faster)
+# MERGE_NB -- Oracle MV -> Fabric Delta sync framework  (v5.2: fewer small files)
 # ============================================================================
 #
 # SAME LOGIC AS BEFORE (two modes, keyed on whether primary_keys is empty):
@@ -125,6 +125,24 @@
 #      all are soft-deleted, keeps the v5 path. _FIRST_LOAD_DIRECT = False
 #      switches this off (exactly v5).
 #
+# v5.2 CHANGE (same rows and same keys as v5.1):
+#
+#  21. Optimized write, with the key that the Fabric docs name:
+#      spark.databricks.delta.optimizeWrite.enabled = true. The key set so far
+#      (spark.microsoft.delta.optimizeWrite.enabled) is the Synapse name and
+#      did not take effect here: every append wrote one file per partition of
+#      the compare result, up to 200 small files per target per run
+#      (2026-11-12: every target had 200 files, even TBL_PAT_ID at ~0 GB).
+#      Each file costs OneLake write operations, and every later run opens it
+#      again when it reads the target. With optimized write, Delta first
+#      groups the rows into files of about the bin size (the Fabric writeHeavy
+#      profile sets 128 MB), so a daily append writes a few files instead of
+#      ~200. Only the file layout changes: the same rows, the same keys, the
+#      same batch rows. It adds one shuffle of the rows being written: small
+#      on a daily run, some minutes on a big first load. Files that are
+#      already written stay as they are. _OPTIMIZE_WRITE = False switches this
+#      off (exactly v5.1).
+#
 # ---- PUT THIS IN THE VERY FIRST CELL (its own cell) TO CAP SESSION SIZE -----
 # %%configure
 # {
@@ -185,6 +203,10 @@ _MODE_A_ONE_PASS = True
 # (no join with the empty target, no second copy). False = exactly v5.
 _FIRST_LOAD_DIRECT = True
 
+# v5.2 (header 21): optimized write with the key the Fabric docs name, so an
+# append writes a few files instead of up to 200. False = exactly v5.1.
+_OPTIMIZE_WRITE = True
+
 # Internal I/U/D tag added to the rows being appended. Deliberately an
 # unlikely name so it can never collide with a business column (a real column
 # called CHANGE_TYPE broke the first version). It is never written to the target.
@@ -241,6 +263,11 @@ def configure_spark_for_efficiency(broadcast_mb=100, shuffle_partitions=200):
         "spark.sql.parquet.datetimeRebaseModeInRead": "CORRECTED",
         "spark.sql.parquet.int96RebaseModeInRead": "CORRECTED",
     }
+    if _OPTIMIZE_WRITE:
+        # v5.2 (header 21): the key above is the Synapse name and did not take
+        # effect here; this is the key the Fabric docs name. A runtime setting
+        # wins over the environment's. File layout only: the same rows.
+        settings["spark.databricks.delta.optimizeWrite.enabled"] = "true"
     for k, v in settings.items():
         try:
             spark.conf.set(k, v)
