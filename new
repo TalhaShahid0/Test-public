@@ -1,261 +1,359 @@
 # ============================================================================
-# CHECK_CLARITY_LOADS (2026-11-18). READ ONLY: reads only the Delta history
-# (table metadata) and the small log tables. No table data is scanned, nothing
-# is written. About 2-5 min.
+# CHECK_NATIVE_DIFF v2 (2026-11-15). READ ONLY: writes nothing, changes no table.
 #
-# Question: on which days and at what time are the Clarity tables of the 25
-# pipelines loaded, and how (whole table rewritten, or only changed rows)?
-# The answer decides three ways to use less capacity:
-#   1. On a day when no input table of a pipeline changed, running it gives
-#      exactly the same result, so the run can be skipped (no CU at all).
-#   2. The Data pipeline should start after the Clarity load has finished.
-#   3. If Clarity is loaded as small changes, a "changed rows only" read is
-#      possible later; if every table is rewritten every day, it is not.
+# CHECK_NATIVE_ENGINE said DIFFERENT for TBL_ALLERGY_NOTES_C (same row count,
+# different ROW_HASH in some rows). This check finds WHICH column differs
+# between the native engine and normal Spark, in how many rows, and what kind
+# of difference it is.
 #
-# HOW TO RUN (a NEW notebook, 2 cells, any time of day):
-#   CELL 1:  %run CONFIG_NB      (the same CONFIG notebook the pipeline uses)
-#   CELL 2:  this file
-# Send the whole output. It has table names, dates, times and row counts
-# only, no patient data.
+# v2 is light. v1 kept both full results in the Spark cache (about 20 GB each)
+# and the executors crashed again and again. v2 keeps, for every row, one
+# small hash per column, and the full values only for a fixed sample of rows
+# (SAMPLE_PCT, picked by the key, so the same rows on both sides). Cache about
+# 3-4 GB per side.
+#
+# It prints NO note text and NO values. Only column names, counts and
+# "kinds" of difference: a letter A-Z is shown as A, a-z as a, a digit as 9,
+# and any other character by its code (like U+FB01). Dates and numbers are
+# shown as shapes (9999-99-99) and differences (+3600 s), never as values.
+#
+# Every column is compared exactly as MERGE puts it into ROW_HASH:
+# coalesce(cast(col as string), '').
+#
+# HOW TO RUN: start a NEW session (stop the old one first), then
+#   CELL 1:  %run MERGE_NB
+#   CELL 2:  %run CONFIG_NB
+#   CELL 3:  this file, from the line "PIPELINE = ..." down.
+# NOTES_C: about 40 minutes. Not during the pipeline or a Clarity load.
+# Send the whole output of cell 3 (and the error summary if a job fails).
 # ============================================================================
 
-DAYS = 14          # how many days back
-HISTORY_LIMIT = 60  # commits read per table (a table loaded once a day needs ~14-30)
+PIPELINE = "TBL_ALLERGY_NOTES_C"
+KEY_COLS = ["NOTE_ID", "NOTE_CSN_ID"]   # columns that identify a row
+SAMPLE_PCT = 5                          # % of rows whose values are kept for the "kinds" part
+MAX_ANALYSED = 300                      # differing sample rows looked at, per column (top 5 columns)
 
+import math
 import re
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+from datetime import datetime
+from functools import reduce
+from pyspark import StorageLevel
+from pyspark.sql import functions as F
 
-if "pipeline_configs" not in globals():
-    raise RuntimeError("'pipeline_configs' is not defined: run cell 1 (%run CONFIG_NB) "
-                       "in this session first")
+for _needed, _cell in (("configure_spark_for_efficiency", "%run MERGE_NB"),
+                       ("_sync_spec", "%run MERGE_NB"),
+                       ("pipeline_configs", "%run CONFIG_NB")):
+    if _needed not in globals():
+        raise RuntimeError(f"'{_needed}' is not defined: run '{_cell}' in this session first")
 
-_t0 = time.time()
-_OURS = "ALLERGY_LH.ALLERGY_DELTA."          # written by this pipeline
-_CLARITY = "CLARITY_LH.CLARITY."
-_BATCH_TABLE = pipeline_configs[0].get("batch_table", _OURS + "ALLERGY_BATCHES")
-_RUN_TABLE = _OURS + "ALLERGY_ETL_RUN_LOG"
-_NAME_RE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*)\b", re.I)
-# operations that do not change the rows of a table
-_MAINT = {"OPTIMIZE", "VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "UNSET TBLPROPERTIES",
-          "UPGRADE PROTOCOL", "FSCK", "ADD CONSTRAINT", "DROP CONSTRAINT", "CHANGE COLUMN",
-          "ADD COLUMNS", "REPLACE COLUMNS", "RENAME COLUMN", "DROP COLUMNS", "REORG",
-          "COMPUTE STATS", "ANALYZE STATS", "ADD FEATURE", "DROP FEATURE", "CREATE TABLE"}
+configure_spark_for_efficiency()          # the same Spark settings as a pipeline run
+spark.catalog.clearCache()                # frees anything an earlier check left in this session's cache
+
+# a fixed text, hashed by both engines: tells whether their hash functions agree
+_CTL = "control: abc XYZ 0123456789 ß ﬁ é ° • µ ± — 漢字 | " * 3
 
 
-def _short(t):
-    return t[len(_CLARITY):] if t.startswith(_CLARITY) else t
+def _set_native(on):
+    spark.conf.set("spark.native.enabled", "true" if on else "false")
 
 
-def _num(m, *keys):
-    tot, seen = 0, False
-    for k in keys:
-        v = (m or {}).get(k)
-        if v not in (None, ""):
-            try:
-                tot += int(float(v))
-                seen = True
-            except ValueError:
-                pass
-    return tot if seen else None
+def _plan(df):
+    try:
+        return df._jdf.queryExecution().executedPlan().toString()
+    except Exception:
+        return ""
 
 
-def _fmt_rows(n):
-    if n is None:
-        return "?"
-    for unit, div in (("B", 10 ** 9), ("M", 10 ** 6), ("K", 10 ** 3)):
-        if n >= div:
-            return f"{n / div:.1f}{unit}"
-    return str(n)
+def _native_ops(p):
+    return p.count("Transformer") + p.count("NativeFileScan")
 
 
-def _kind(op, params):
-    op = (op or "").upper()
-    if op in _MAINT:
-        return "maint"
-    if op.startswith("WRITE") or "AS SELECT" in op:
-        mode = str((params or {}).get("mode", "")).lower()
-        return "rewrite" if ("AS SELECT" in op or mode == "overwrite") else "append"
-    if op == "STREAMING UPDATE":
-        return "append"
-    if op == "MERGE":
-        return "merge"
-    if op in ("DELETE", "UPDATE", "TRUNCATE"):
-        return op.lower()
-    return "other:" + op.lower()
+def _mask(s):
+    # letters and digits hidden; every other character shown by its code
+    out = []
+    for ch in s:
+        if "A" <= ch <= "Z":
+            out.append("A")
+        elif "a" <= ch <= "z":
+            out.append("a")
+        elif "0" <= ch <= "9":
+            out.append("9")
+        else:
+            out.append(f"U+{ord(ch):04X}" + (f" '{ch}'" if ch.isprintable() and not ch.isspace() else ""))
+    return " ".join(out) or "(end)"
 
 
-def _rows_changed(kind, m):
-    if kind in ("rewrite", "append"):
-        return _num(m, "numOutputRows")
-    if kind == "merge":
-        return _num(m, "numTargetRowsInserted", "numTargetRowsUpdated", "numTargetRowsDeleted")
-    if kind == "delete":
-        return _num(m, "numDeletedRows")
-    if kind == "update":
-        return _num(m, "numUpdatedRows")
+def _shape(s):
+    return re.sub(r"[0-9]", "9", s)
+
+
+def _ts(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
     return None
 
 
-# ---- inputs of every pipeline (table names in FROM / JOIN of its query) ----
-_inputs = {c["pipeline_name"]: sorted({m.group(1).upper() for m in _NAME_RE.finditer(c["source_query"])})
-           for c in pipeline_configs}
-_tables = sorted({t for ts in _inputs.values() for t in ts})
-_users = defaultdict(list)
-for _p, _ts in _inputs.items():
-    for _t in _ts:
-        _users[_t].append(_p)
-
-_now = datetime.now()
-_since = (_now - timedelta(days=DAYS - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-_days = [(_since + timedelta(days=i)).date() for i in range(DAYS)]
-
-
-def _history(t):
+def _num(s):
     try:
-        rows = (spark.sql(f"DESCRIBE HISTORY {t} LIMIT {HISTORY_LIMIT}")
-                .select("version", "timestamp", "operation", "operationParameters", "operationMetrics")
-                .collect())
-    except Exception as e:
-        return t, None, str(e).split("\n")[0][:120], False
-    out = []
-    for r in rows:
-        ts = r["timestamp"]
-        if ts is None or ts < _since:
-            continue
-        kind = _kind(r["operation"], r["operationParameters"])
-        out.append(dict(ts=ts, op=r["operation"], kind=kind,
-                        rows=_rows_changed(kind, r["operationMetrics"])))
-    cut = len(rows) == HISTORY_LIMIT and rows[-1]["timestamp"] is not None and rows[-1]["timestamp"] >= _since
-    return t, out, None, cut
+        return float(s)
+    except ValueError:
+        return None
 
 
-with ThreadPoolExecutor(max_workers=8) as _pool:
-    _res = list(_pool.map(_history, _tables))
-_hist = {t: h for t, h, err, cut in _res if h is not None}
-_fail = {t: err for t, h, err, cut in _res if h is None}
-_cut = {t for t, h, err, cut in _res if cut}
+def _num_tag(a, b):
+    fa, fb = _num(a), _num(b)
+    if fa is None or fb is None:
+        return "not a number"
+    if fa == fb:
+        return "same number, written differently"
+    try:
+        return f"different number, relative difference ~1e{math.floor(math.log10(abs(fb - fa) / abs(fa)))}"
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return "different number"
 
+
+def _kind(a, b, typ):
+    # a = normal Spark, b = native; returns a description without any value
+    if typ == "string":
+        m = min(len(a), len(b))
+        p = next((k for k in range(m) if a[k] != b[k]), m)
+        where = "at start" if p == 0 else ("at end" if p == m else "in middle")
+        ma, mb = _mask(a[p:p + 3]), _mask(b[p:p + 3])
+        return f"{where}: normal {ma}  |  native {mb}" + ("  (other letters or digits)" if ma == mb else "")
+    shapes = "same shape" if _shape(a) == _shape(b) else f"normal '{_shape(a)}'  |  native '{_shape(b)}'"
+    if typ.startswith("timestamp") or typ == "date":
+        ta, tb = _ts(a), _ts(b)
+        return f"{shapes}  |  " + (f"native - normal = {(tb - ta).total_seconds():+g} s"
+                                   if ta and tb else "not a date")
+    if typ in ("double", "float", "int", "bigint", "smallint", "tinyint") or typ.startswith("decimal"):
+        return f"{shapes}  |  {_num_tag(a, b)}"
+    return shapes
+
+
+def _len_bucket(d):
+    return "0" if d == 0 else (f"{d:+d}" if abs(d) <= 3 else ("more than +3" if d > 0 else "less than -3"))
+
+
+def _any(cols_):
+    return reduce(lambda x, y: x | y, cols_)
+
+
+def _run(cached):
+    t0 = time.time()
+    cfg = {c["pipeline_name"]: c for c in pipeline_configs}[PIPELINE]
+    q = cfg["source_query"]
+    spec = _sync_spec(cfg["target_table"], cfg.get("primary_keys", ""),
+                      cfg.get("non_key_columns", ""), cfg.get("identity_column"))
+    _set_native(False)
+    plain = spark.sql(q)                  # only resolves names and types, runs nothing
+    by_lower = {c.lower(): c for c in plain.columns}
+    types = dict(plain.dtypes)
+    cols = [by_lower[c] for c in spec["allColsList"] if c != spec["identityLower"] and c in by_lower]
+    missing = [k for k in KEY_COLS if k.lower() not in by_lower]
+    if missing:
+        raise ValueError(f"KEY_COLS {missing} are not columns of the {PIPELINE} source query")
+    keys = [by_lower[k.lower()] for k in KEY_COLS]
+    hash_cols = spec["pkList"] or [c for c in spec["allColsList"] if c != spec["identityLower"]]
+    hash_idx = [cols.index(by_lower[c]) for c in hash_cols]     # ROW_HASH columns, in MERGE's order
+    sample_keys = [k for k in keys if types[k] == "string"] or keys
+    kc = [f"__k{j}" for j in range(len(keys))]
+    hc = [f"__h{i}" for i in range(len(cols))]
+
+    def prepared(df, with_rh):
+        s = [F.coalesce(F.col(c).cast("string"), F.lit("")) for c in cols]   # as MERGE feeds ROW_HASH
+        kh = F.hash(*[F.col(k) for k in sample_keys])
+        smp = F.pmod(kh, F.lit(100)) < F.lit(SAMPLE_PCT)                     # same rows on both sides
+        out = [F.col(k).alias(x) for k, x in zip(keys, kc)]                  # keys as they are, no cast
+        out += [F.xxhash64(e).alias(h) for e, h in zip(s, hc)]
+        out += [F.xxhash64(F.concat(F.lit(_CTL), kh.cast("string"))).alias("__ctl"),
+                smp.alias("__smp"),
+                F.when(smp, F.array(*s)).alias("__arr")]                    # full values: sample only
+        if with_rh:
+            out.append(F.when(smp, F.expr(spec["rowHashExpr"])).alias("__rh"))
+        return df.select(*out)
+
+    print(f"CHECK_NATIVE_DIFF v2 {PIPELINE} | Spark {spark.version} | keys {', '.join(keys)} | "
+          f"{len(cols)} columns | sample {SAMPLE_PCT}%", flush=True)
+
+    # 1) native engine first (if it fails, it fails early)
+    _set_native(True)
+    t = time.time()
+    pn = prepared(spark.sql(q), True).persist(StorageLevel.MEMORY_AND_DISK)
+    cached.append(pn)
+    nn = pn.count()
+    plan_n = _plan(pn)
+    _set_native(False)
+    ops = _native_ops(plan_n)
+    casts_native = any("xxhash64(" in ln and "Transformer" in ln for ln in plan_n.splitlines())
+    print(f"native engine: {nn:,} rows in {(time.time() - t) / 60:.1f} min | native operators {ops} | "
+          f"casts to string done by the native engine: {'yes' if casts_native else 'NO'}", flush=True)
+    if ops == 0:
+        raise RuntimeError("the native run had no native operators, so the native engine did not "
+                           "really run and a comparison would mean nothing. Send this output.")
+    if not casts_native:
+        print("   (so a difference that comes only from cast(... as string) would not show here)",
+              flush=True)
+
+    # 2) normal Spark (native is OFF from here on)
+    t = time.time()
+    pv = prepared(spark.sql(q), False).persist(StorageLevel.MEMORY_AND_DISK)
+    cached.append(pv)
+    nv = pv.count()
+    print(f"normal Spark : {nv:,} rows in {(time.time() - t) / 60:.1f} min", flush=True)
+
+    # 3) ALL rows: pair on the keys and compare the per-column hashes
+    t = time.time()
+    dup_n = pn.groupBy(*kc).count().filter("count > 1").count()
+    dup_v = pv.groupBy(*kc).count().filter("count > 1").count()
+
+    def side(df, p):
+        return df.select(*[F.col(k).alias(p + k) for k in kc], *[F.col(h).alias(p + h) for h in hc],
+                         F.col("__ctl").alias(p + "ctl"), F.col("__smp").alias(p + "smp"))
+
+    j = side(pv, "v").join(side(pn, "n"), [F.col("v" + k).eqNullSafe(F.col("n" + k)) for k in kc],
+                           "full_outer")
+    in_v, in_n = F.col("v" + hc[0]).isNotNull(), F.col("n" + hc[0]).isNotNull()
+    flags = [F.coalesce(F.col("v" + h) != F.col("n" + h), F.lit(False)) for h in hc]
+    ctl_bad = F.coalesce(F.col("vctl") != F.col("nctl"), F.lit(False))
+    smp_bad = F.coalesce(F.col("vsmp") != F.col("nsmp"), F.lit(False))
+    d = (j.filter(~(in_v & in_n) | _any(flags) | ctl_bad | smp_bad)
+          .select(*[F.coalesce(F.col("v" + k), F.col("n" + k)).alias(k) for k in kc],
+                  in_v.alias("in_v"), in_n.alias("in_n"),
+                  *[f.alias(f"d{i}") for i, f in enumerate(flags)],
+                  ctl_bad.alias("ctl_bad"), smp_bad.alias("smp_bad"))
+          .persist(StorageLevel.MEMORY_AND_DISK))
+    cached.append(d)
+    both = F.col("in_v") & F.col("in_n")
+    aggs = [F.count(F.when(F.col("in_v") & ~F.col("in_n"), 1)).alias("only_v"),
+            F.count(F.when(F.col("in_n") & ~F.col("in_v"), 1)).alias("only_n"),
+            F.count(F.when(both & _any([F.col(f"d{i}") for i in range(len(cols))]), 1)).alias("any_diff"),
+            F.count(F.when(both & F.col("ctl_bad"), 1)).alias("ctl"),
+            F.count(F.when(both & F.col("smp_bad"), 1)).alias("smpb")]
+    aggs += [F.count(F.when(both & F.col(f"d{i}"), 1)).alias(f"c{i}") for i in range(len(cols))]
+    r = d.agg(*aggs).collect()[0]
+    hash_ok = r["ctl"] == 0
+    print(f"compare all rows: {(time.time() - t) / 60:.1f} min", flush=True)
+    print(f"keys only in native: {r['only_n']:,} | only in normal: {r['only_v']:,} | "
+          f"duplicate keys: native {dup_n:,}, normal {dup_v:,}", flush=True)
+    if dup_n or dup_v:
+        print("   (a duplicate key pairs its rows more than once, so some differences below are not real)",
+              flush=True)
+    print(f"self-check: the two engines hash the same fixed text differently in {r['ctl']:,} rows"
+          + (" (0 = same hash function, so the counts below are exact)" if hash_ok else
+             " (NOT 0: the counts below are not reliable; use the sample counts further down)"),
+          flush=True)
+    if r["smpb"]:
+        print(f"   sample picked differently in {r['smpb']:,} rows (those rows cannot be paired)", flush=True)
+    print(f"ALL rows (same key) with at least one column different: {r['any_diff']:,} of {min(nn, nv):,}",
+          flush=True)
+    bad = sorted([(i, r[f"c{i}"]) for i in range(len(cols)) if r[f"c{i}"] > 0], key=lambda x: -x[1])
+    for i, cnt in bad:
+        print(f"   {cols[i]} ({types[cols[i]]}): {cnt:,} rows", flush=True)
+
+    # 4) the SAMPLE: exact text compare, and is the hash function itself the same?
+    t = time.time()
+    sv = pv.filter(F.col("__smp")).select(*[F.col(k).alias("v" + k) for k in kc], F.col("__arr").alias("varr"))
+    sn = pn.filter(F.col("__smp")).select(*[F.col(k).alias("n" + k) for k in kc], F.col("__arr").alias("narr"),
+                                          F.col("__rh").alias("nrh"))
+    sj = sv.join(sn, [F.col("v" + k).eqNullSafe(F.col("n" + k)) for k in kc], "full_outer")
+    rh_v = F.sha2(F.concat_ws("||", *[F.col("narr").getItem(i) for i in hash_idx]), 256)
+    e = (sj.select(*[F.coalesce(F.col("v" + k), F.col("n" + k)).alias(k) for k in kc],
+                   F.col("varr").isNotNull().alias("in_v"), F.col("narr").isNotNull().alias("in_n"),
+                   *[F.coalesce(F.col("varr").getItem(i) != F.col("narr").getItem(i), F.lit(False)).alias(f"e{i}")
+                     for i in range(len(cols))],
+                   (F.col("narr").isNotNull() & ~rh_v.eqNullSafe(F.col("nrh"))).alias("rh_bad"))
+         .persist(StorageLevel.MEMORY_AND_DISK))
+    cached.append(e)
+    sboth = F.col("in_v") & F.col("in_n")
+    saggs = [F.count(F.when(sboth, 1)).alias("paired"),
+             F.count(F.when(F.col("in_v") & ~F.col("in_n"), 1)).alias("only_v"),
+             F.count(F.when(F.col("in_n") & ~F.col("in_v"), 1)).alias("only_n"),
+             F.count(F.when(sboth & _any([F.col(f"e{i}") for i in range(len(cols))]), 1)).alias("any_diff"),
+             F.count(F.when(F.col("in_n"), 1)).alias("n_rows"),
+             F.count(F.when(F.col("rh_bad"), 1)).alias("rh_bad")]
+    saggs += [F.count(F.when(sboth & F.col(f"e{i}"), 1)).alias(f"c{i}") for i in range(len(cols))]
+    sr = e.agg(*saggs).collect()[0]
+    print(f"compare sample: {(time.time() - t) / 60:.1f} min", flush=True)
+    print(f"SAMPLE: {sr['paired']:,} rows paired (only in normal {sr['only_v']:,}, only in native "
+          f"{sr['only_n']:,}); {sr['any_diff']:,} with at least one column different (exact text compare)",
+          flush=True)
+    sbad = sorted([(i, sr[f"c{i}"]) for i in range(len(cols)) if sr[f"c{i}"] > 0], key=lambda x: -x[1])
+    for i, cnt in sbad:
+        print(f"   {cols[i]} ({types[cols[i]]}): {cnt:,} sample rows", flush=True)
+    print(f"hash check (sample): native ROW_HASH differs from normal Spark's ROW_HASH of the same values in "
+          f"{sr['rh_bad']:,} of {sr['n_rows']:,} rows"
+          + (" (so the hash function is not the cause)" if sr["rh_bad"] == 0 else ""), flush=True)
+
+    # 5) what kind of difference: up to MAX_ANALYSED differing sample rows of each of the top 5 columns
+    top = [i for i, _ in (bad if hash_ok else sbad)[:5]]
+    if top:
+        ks = (reduce(lambda x, y: x.unionByName(y),
+                     [e.filter(sboth & F.col(f"e{i}")).select(*kc, *[f"e{t_}" for t_ in top]).limit(MAX_ANALYSED)
+                      for i in top])
+              .dropDuplicates(kc)
+              .persist(StorageLevel.MEMORY_AND_DISK))
+        cached.append(ks)
+        spark_flags = {tuple(x[k] for k in kc): x for x in ks.collect()}
+        kq = ks.select(*[F.col(k).alias(f"q{jj}") for jj, k in enumerate(kc)])
+
+        def fetch(df):
+            cond = [F.col(k).eqNullSafe(F.col(f"q{jj}")) for jj, k in enumerate(kc)]
+            out = defaultdict(list)
+            for x in (df.filter(F.col("__smp")).join(F.broadcast(kq), cond, "left_semi")
+                        .select(*kc, "__arr").collect()):
+                out[tuple(x[k] for k in kc)].append(x["__arr"])
+            return out
+
+        fv, fn = fetch(pv), fetch(pn)
+        print("kinds of difference, from the sample (normal = normal Spark, native = native engine; "
+              "A = letter A-Z, a = letter a-z, 9 = digit, others by code):", flush=True)
+        for i in top:
+            kinds, lens = Counter(), Counter()
+            looked = skipped = 0
+            for key, fl in spark_flags.items():
+                if looked >= MAX_ANALYSED:
+                    break
+                if not fl[f"e{i}"]:
+                    continue
+                rv, rn = fv.get(key, []), fn.get(key, [])
+                if len(rv) != 1 or len(rn) != 1:
+                    skipped += 1
+                    continue
+                a, b = rv[0][i], rn[0][i]
+                looked += 1
+                if a == b:
+                    kinds["Spark sees a difference, Python does not (bytes that are not valid UTF-8?)"] += 1
+                    continue
+                kinds[_kind(a, b, types[cols[i]])] += 1
+                lens[_len_bucket(len(b) - len(a))] += 1
+            if looked == 0 and not skipped:
+                print(f"{cols[i]} ({types[cols[i]]}): no differing row in the {SAMPLE_PCT}% sample "
+                      f"(it differs in only a few rows)", flush=True)
+                continue
+            print(f"{cols[i]} ({types[cols[i]]}): {looked} differing sample rows looked at"
+                  + (f", {skipped} skipped (duplicate key)" if skipped else ""), flush=True)
+            for k_, cnt in kinds.most_common(15):
+                print(f"   {cnt:>5}  {k_}", flush=True)
+            if len(kinds) > 15:
+                print(f"   ... and {len(kinds) - 15} more kinds", flush=True)
+            if lens:
+                print(f"   length, native minus normal: {dict(lens.most_common(8))}", flush=True)
+    print(f"done in {(time.time() - t0) / 60:.0f} min", flush=True)
+
+
+_cached = []
 try:
-    _tz = spark.conf.get("spark.sql.session.timeZone")
-except Exception:
-    _tz = "?"
-print(f"CHECK_CLARITY_LOADS | {len(pipeline_configs)} pipelines, {len(_tables)} input tables | "
-      f"days {_days[0]:%m-%d} .. {_days[-1]:%m-%d} | times in session time zone {_tz} | now {_now:%m-%d %H:%M}")
-for t, err in _fail.items():
-    print(f"   could not read history of {t}: {err}")
-
-# ---- 1. per input table: data changes per day ----
-_header = "".join(d.strftime("%a")[0] for d in _days)
-print()
-print("== 1. Data changes per day of every input table (not written by this pipeline)")
-print("   one character per day: digit = number of data changes that day, m = only "
-      "OPTIMIZE/VACUUM-type commits, . = nothing")
-print("   'rewrite' = whole table written again, 'merge'/'append'/'delete'/'update' = only some rows")
-print(f"   {'table (CLARITY_LH.CLARITY. left out)':<34} {'used by':>7}  {_header}  how, last {DAYS} days")
-_ext = [t for t in _tables if not t.startswith(_OURS)]
-_ext.sort(key=lambda t: (-len(_users[t]), t))
-for t in _ext:
-    if t not in _hist:
-        continue
-    h = _hist[t]
-    per_day = defaultdict(lambda: [0, 0])
-    for c in h:
-        per_day[c["ts"].date()][0 if c["kind"] != "maint" else 1] += 1
-    pat = ""
-    for d in _days:
-        n, mt = per_day.get(d, [0, 0])
-        pat += (str(n) if n < 10 else "+") if n else ("m" if mt else ".")
-    data = [c for c in h if c["kind"] != "maint"]
-    kinds = defaultdict(list)
-    for c in data:
-        kinds[c["kind"]].append(c["rows"])
-    how = ", ".join(
-        f"{k} x{len(v)} (~{_fmt_rows(int(sum(x for x in v if x is not None) / max(1, sum(1 for x in v if x is not None))))} rows)"
-        if any(x is not None for x in v) else f"{k} x{len(v)}"
-        for k, v in sorted(kinds.items(), key=lambda kv: -len(kv[1]))) or "no data change"
-    if data:
-        mins = sorted(c["ts"].hour * 60 + c["ts"].minute for c in data)
-        how += f", at {mins[0] // 60:02d}:{mins[0] % 60:02d}-{mins[-1] // 60:02d}:{mins[-1] % 60:02d}"
-    if t in _cut:
-        how += f" (only the last {HISTORY_LIMIT} commits read)"
-    print(f"   {_short(t)[:34]:<34} {len(_users[t]):>3} pipe  {pat}  {how}")
-
-# ---- 2. per day: when Clarity was loaded, and when this pipeline ran ----
-print()
-print("== 2. Per day: first and last data change of the Clarity tables, and this pipeline's rounds")
-_runs = defaultdict(list)
-try:
-    for r in (spark.sql(f"SELECT RUN_ID, STATUS, COALESCE(SESSION_START_DTTM, RUN_START_DTTM) AS S, "
-                        f"RUN_END_DTTM AS E FROM {_RUN_TABLE}").collect()):
-        if r["S"] is not None and r["S"] >= _since:
-            _runs[r["S"].date()].append(r)
-except Exception as e:
-    print(f"   (run log not readable: {str(e).splitlines()[0][:100]})")
-_clar = [t for t in _ext if t.startswith(_CLARITY) and t in _hist]
-for d in _days:
-    ch = [(c["ts"], t) for t in _clar for c in _hist[t] if c["kind"] != "maint" and c["ts"].date() == d]
-    if ch:
-        ch.sort()
-        load = (f"{ch[0][0]:%H:%M} - {ch[-1][0]:%H:%M}, {len({t for _, t in ch})} of {len(_clar)} "
-                f"Clarity tables changed")
-    else:
-        load = f"NO Clarity table changed"
-    rr = "; ".join(f"run {r['RUN_ID']} {r['S']:%H:%M}-{(r['E'].strftime('%H:%M') if r['E'] else '?')} "
-                   f"{r['STATUS']}" for r in sorted(_runs.get(d, []), key=lambda r: r["S"]))
-    print(f"   {d:%a %m-%d}: {load:<48} | this pipeline: {rr or '-'}")
-
-# ---- 3. per pipeline: did any input change after its last successful sync? ----
-print()
-print("== 3. Per pipeline: inputs changed after its last successful sync (batch start)?")
-_last_ok = {}
-try:
-    for r in (spark.sql(f"SELECT PIPELINE_NAME, MAX(BATCH_START_DTTM) AS S FROM {_BATCH_TABLE} "
-                        f"WHERE STATUS = 'SUCCESS' GROUP BY PIPELINE_NAME").collect()):
-        _last_ok[r["PIPELINE_NAME"]] = r["S"]
-except Exception as e:
-    print(f"   (batch table not readable: {str(e).splitlines()[0][:100]})")
-_unchanged = []
-for c in pipeline_configs:
-    p = c["pipeline_name"]
-    s = _last_ok.get(p)
-    if s is None:
-        print(f"   {p:<34} no successful sync yet")
-        continue
-    changed, unknown = [], []
-    for t in _inputs[p]:
-        if t not in _hist:
-            unknown.append(_short(t))
-            continue
-        if any(x["kind"] != "maint" and x["ts"] >= s for x in _hist[t]):
-            changed.append(_short(t))
-        elif s < _since:
-            unknown.append(_short(t))
-    if changed:
-        verdict = f"{len(changed)} of {len(_inputs[p])} inputs changed: {', '.join(changed)[:90]}"
-    elif unknown:
-        verdict = f"no change seen, but not sure for: {', '.join(unknown)[:80]}"
-    else:
-        verdict = "NO input changed -> a run now would give exactly the same result"
-        _unchanged.append(p)
-    print(f"   {p:<34} last sync {s:%m-%d %H:%M} | {verdict}")
-
-# ---- 4. summary ----
-print()
-print("== 4. Summary")
-_quiet = [d for d in _days
-          if not any(c["kind"] != "maint" and c["ts"].date() == d for t in _clar for c in _hist[t])]
-print(f"   days without any Clarity data change: "
-      f"{', '.join(f'{d:%a %m-%d}' for d in _quiet) if _quiet else 'none'}")
-_rew = [t for t in _clar if _hist[t] and all(c["kind"] in ("rewrite", "maint") for c in _hist[t])
-        and any(c["kind"] == "rewrite" for c in _hist[t])]
-print(f"   Clarity tables always rewritten in full: {len(_rew)} of {len(_clar)}"
-      + (f" (e.g. {', '.join(_short(t) for t in _rew[:6])})" if _rew else ""))
-print(f"   pipelines whose inputs did not change since their last sync: {len(_unchanged)} of "
-      f"{len(pipeline_configs)}" + (f" ({', '.join(_unchanged)[:120]})" if _unchanged else ""))
-if _cut:
-    print(f"   NOTE: {len(_cut)} tables have more than {HISTORY_LIMIT} commits in {DAYS} days: set "
-          f"HISTORY_LIMIT = 500 at the top and run this cell again")
-print(f"   done in {time.time() - _t0:.0f} s")
+    _run(_cached)
+finally:
+    for _df in _cached:
+        try:
+            _df.unpersist()
+        except Exception:
+            pass
+    _set_native(False)
+    print("(caches freed, native left OFF for this session)", flush=True)
