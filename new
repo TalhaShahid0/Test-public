@@ -1,420 +1,162 @@
 # ============================================================================
-# CHECK_NATIVE_DIFF v3 (2026-11-19). READ ONLY: writes nothing, changes no table.
+# CHECK_NATIVE_ENGINE (2026-11-12, stop rules added 2026-11-19). READ ONLY: writes nothing,
+# changes no table. It keeps nothing in the Spark cache (each run returns one small row).
 #
-# CHECK_NATIVE_ENGINE said DIFFERENT for TBL_ALLERGY_NOTES_C. This check finds
-# WHICH output column differs between the native engine and normal Spark, and
-# WHICH function of the NOTES_C query causes it.
+# Question: if the Fabric Native Execution Engine is switched on, do the
+# pipelines still give exactly the same rows and the same ROW_HASH? And how
+# much faster are their source queries with it?
 #
-# Why v3: v2 (2026-11-18/19 on Fabric) ran both queries (native 12.7 min,
-# normal 20.9 min), then its compare of all rows never finished and the session
-# was killed at the 4-hour limit. v1 failed at the same point. Both kept the
-# native result in the Spark cache and compared it after switching native off.
-# v3 keeps NOTHING in the cache and joins nothing big: every run returns only
-# small numbers to the driver. And it stops itself after MAX_MINUTES.
+# For each pipeline of the chosen GROUP it runs the source query twice in the
+# same session, first with the native engine ON, then OFF (normal Spark), and
+# compares a fingerprint of the result:
+#   - number of rows
+#   - ROW_HASH exactly as MERGE computes it (MERGE's own _sync_spec)
+#   - a second hash over ALL business columns, so every value is compared
+#     (for the 3 tables with primary keys, ROW_HASH covers only the keys)
+# "SAME" = same row count and the same set of hashes. Any "DIFFERENT" means
+# the native engine must NOT be switched on for the pipeline.
 #
-#   PART 1 (about 5-10 min): the text functions of the NOTES_C query (upper,
-#     trim, regexp_replace [\p{Cc}], the & < > " ' replaces, the whole XML
-#     piece, the "length(trim) > 0" filter) and cast(CONTACT_DATE_REAL as
-#     string), on the lines of a few HNO_NOTE_TEXT files, native vs normal,
-#     line by line. For lines that differ: what kind of difference.
-#   PART 2 (about 35 min, RUN_PART_2 = True): the whole NOTES_C query once
-#     with each engine, folded into BUCKETS small groups per column -> which
-#     output columns differ, and in about how many rows.
-#
-# It prints NO note text and NO values. Only column and function names,
-# counts, and "kinds" of difference: a letter A-Z is shown as A, a-z as a, a
-# digit as 9, any other character by its code and Unicode name (like U+00DF
-# LATIN SMALL LETTER SHARP S). Numbers and dates are shown as shapes.
-#
-# HOW TO RUN: start a NEW session (stop the old one first), then
-#   CELL 1:  %run MERGE_NB
-#   CELL 2:  %run CONFIG_NB
-#   CELL 3:  this file, from the line "PIPELINE = ..." down.
-# About 45 min. Not during the pipeline or a Clarity load (12:30-22:10 PKT).
-# At the end it stops the session itself (STOP_SESSION_AT_END), so no idle
-# session keeps using capacity. Send the whole output of cell 3.
+# HOW TO RUN (a NEW notebook, 4 cells, in the same workspace as the pipeline):
+#   CELL 1 (its own cell, must be the FIRST cell):
+#       %%configure -f
+#       {
+#           "conf": {
+#               "spark.native.enabled": "true"
+#           }
+#       }
+#   CELL 2:  %run MERGE_NB        (the same MERGE notebook the pipeline uses)
+#   CELL 3:  %run CONFIG_NB       (the same CONFIG notebook the pipeline uses)
+#   CELL 4:  this file, from the line "GROUP = 3" down.
+# Run it in the daytime, NOT while the nightly pipeline or a Clarity load
+# runs (the data must not change between the two runs of a query).
+# Each group fits easily in one session. Start with GROUP = 3 (NOTES_C, where
+# native should help most), send the whole output of cell 4, then GROUP = 4,
+# 2 and 1 (change GROUP and run cell 4 again; same session is fine):
+#   1 = the 20 light pipelines (~1 h)   2 = LABS, LABS_POP, FLWSHT (~1-1.5 h)
+#   3 = NOTES_C (~1 h)                  4 = MEDS (~1.5-2 h)
 # ============================================================================
 
-PIPELINE = "TBL_ALLERGY_NOTES_C"
-KEY_COLS = ["NOTE_ID", "NOTE_CSN_ID"]           # identify an output row (used only for buckets)
-LINES_TABLE = "CLARITY_LH.CLARITY.HNO_NOTE_TEXT"
-LINE_KEYS = ["NOTE_ID", "NOTE_CSN_ID", "LINE"]  # identify a line of HNO_NOTE_TEXT
-FILES = 6                     # PART 1: how many files of HNO_NOTE_TEXT are read
-MAX_LINES = 300000            # PART 1: at most about this many lines are compared
-RUN_PART_2 = True
-BUCKETS = 65521               # PART 2 (a prime: spreads keys that grow together)
-MAX_ANALYSED = 300            # differing rows looked at, per function / column
-MAX_MINUTES = 75              # the check cancels its Spark jobs after this many minutes
-STOP_SESSION_AT_END = True
+GROUP = 3
+MAX_MINUTES = 200             # the check cancels its Spark jobs after this many minutes
+STOP_SESSION_AT_END = True    # stop the session when done, so it does not keep using capacity
 
-import math
 import threading
 import time
-import unicodedata
-from collections import Counter, defaultdict
-from datetime import datetime
 from pyspark.sql import functions as F
-from pyspark.sql.types import (ByteType, DecimalType, IntegerType, LongType, ShortType, StringType,
-                               StructField, StructType)
 
-for _needed, _cell in (("configure_spark_for_efficiency", "%run MERGE_NB"),
-                       ("_sync_spec", "%run MERGE_NB"),
-                       ("pipeline_configs", "%run CONFIG_NB")):
+# Cells 2 and 3 must have run in THIS session (after cell 1: %%configure -f
+# restarts the session and clears everything that ran before it).
+for _needed, _cell in (("configure_spark_for_efficiency", "cell 2: %run MERGE_NB"),
+                       ("_sync_spec", "cell 2: %run MERGE_NB"),
+                       ("pipeline_configs", "cell 3: %run CONFIG_NB")):
     if _needed not in globals():
-        raise RuntimeError(f"'{_needed}' is not defined: run '{_cell}' in this session first")
+        raise RuntimeError(f"'{_needed}' is not defined: run {_cell} in this session first "
+                           f"(order: cell 1, then 2, then 3, then this cell)")
+
+_GROUPS = {
+    2: ["TBL_ALLERGY_LABS", "TBL_ALLERGY_LABS_POP", "TBL_ALLERGY_FLWSHT"],
+    3: ["TBL_ALLERGY_NOTES_C"],
+    4: ["TBL_ALLERGY_MEDS"],
+}
+_heavy = {n for names in _GROUPS.values() for n in names}
+if GROUP == 1:
+    _names = [c["pipeline_name"] for c in pipeline_configs if c["pipeline_name"] not in _heavy]
+else:
+    _names = _GROUPS[GROUP]
+_by_name = {c["pipeline_name"]: c for c in pipeline_configs}
 
 configure_spark_for_efficiency()          # the same Spark settings as a pipeline run
-spark.catalog.clearCache()
-
-# a fixed text, hashed by both engines: do their hash functions agree?
-_CTL = "control: abc XYZ 0123456789 ß ﬁ é ° • µ ± — 漢字 | " * 3
-_T0 = time.time()
-_STOPPED = []
 
 
-def _set_native(on):
-    spark.conf.set("spark.native.enabled", "true" if on else "false")
+def _hash_exprs(cfg):
+    spec = _sync_spec(cfg["target_table"], cfg.get("primary_keys", ""),
+                      cfg.get("non_key_columns", ""), cfg.get("identity_column"))
+    cols = [c for c in spec["allColsList"] if c != spec["identityLower"]]
+    all_cols = ", ".join(f"coalesce(cast({c} as string), '')" for c in cols)
+    return spec["rowHashExpr"], f"sha2(concat_ws('||', {all_cols}), 256)"
 
 
-def _plan(df):
+def _native_ops(df):
     try:
-        return df._jdf.queryExecution().executedPlan().toString()
+        p = df._jdf.queryExecution().executedPlan().toString()
+        return p.count("Transformer") + p.count("NativeFileScan")
     except Exception:
-        return ""
+        return -1
 
 
-def _native_ops(p):
-    return p.count("Transformer") + p.count("NativeFileScan")
+def _fingerprint(cfg, native):
+    spark.conf.set("spark.native.enabled", "true" if native else "false")
+    row_hash, all_hash = _hash_exprs(cfg)
+    df = (spark.sql(cfg["source_query"])
+          .selectExpr(f"{row_hash} AS rh", f"{all_hash} AS ah")
+          .agg(F.count(F.lit(1)).alias("n"),
+               F.expr("bit_xor(xxhash64(rh))").alias("rh_x"),
+               F.expr("sum(cast(conv(substr(rh, 1, 7), 16, 10) AS BIGINT))").alias("rh_s"),
+               F.expr("bit_xor(xxhash64(ah))").alias("ah_x"),
+               F.expr("sum(cast(conv(substr(ah, 1, 7), 16, 10) AS BIGINT))").alias("ah_s")))
+    t = time.time()
+    r = df.collect()[0]
+    return tuple(r), (time.time() - t) / 60, _native_ops(df)
 
 
-def _mins(t):
-    return f"{(time.time() - t) / 60:.1f} min"
-
-
-def _char(ch):
-    try:
-        name = unicodedata.name(ch)
-    except ValueError:
-        name = unicodedata.category(ch)
-    return f"U+{ord(ch):04X} {name}"
-
-
-def _mask(s):
-    # letters and digits hidden; every other character shown by its code
-    out = []
-    for ch in s:
-        if "A" <= ch <= "Z":
-            out.append("A")
-        elif "a" <= ch <= "z":
-            out.append("a")
-        elif "0" <= ch <= "9":
-            out.append("9")
-        elif ch == " ":
-            out.append("_")
-        else:
-            out.append(f"[{_char(ch)}]")
-    return "".join(out) or "(end)"
-
-
-def _shape(s):
-    return "".join("9" if c.isdigit() else c for c in s)
-
-
-def _kind(a, b, typ="string"):
-    # a = normal Spark, b = native; a description without any value
-    if a is None or b is None:
-        return f"normal {'NULL' if a is None else 'value'} | native {'NULL' if b is None else 'value'}"
-    if typ == "string":
-        m = min(len(a), len(b))
-        p = next((k for k in range(m) if a[k] != b[k]), m)
-        where = "at start" if p == 0 else ("at end" if p == m else "in middle")
-        ma, mb = _mask(a[p:p + 3]), _mask(b[p:p + 3])
-        return f"{where}: normal {ma} | native {mb}" + ("  (other letters or digits)" if ma == mb else "")
-    if _shape(a) == _shape(b):
-        return "same shape, other digits"
-    return f"normal '{_shape(a)}' | native '{_shape(b)}'"
-
-
-def _is_int(t):
-    return isinstance(t, (ByteType, ShortType, IntegerType, LongType)) or (
-        isinstance(t, DecimalType) and t.scale == 0)
-
-
-def _int_expr(name, typ):
-    # an integer from a key column, computed the same way by both engines
-    if _is_int(typ) or isinstance(typ, StringType):
-        return f"CAST(`{name}` AS BIGINT)"     # text that is not a number -> NULL (ANSI is off)
-    return "CAST(0 AS BIGINT)"
+try:
+    _native_start = spark.conf.get("spark.native.enabled")
+except Exception:
+    _native_start = "not set"
+print(f"GROUP {GROUP}: {len(_names)} pipelines | Spark {spark.version} | "
+      f"native at start: {_native_start}", flush=True)
+_results = []
+_STOPPED = []
 
 
 def _watchdog():
     _STOPPED.append(time.time())
-    print(f"\n!!! {MAX_MINUTES} min reached: cancelling the check's Spark jobs "
-          f"(set MAX_MINUTES higher to let it run longer)", flush=True)
+    print(f"\n!!! {MAX_MINUTES} min reached: cancelling the check's Spark jobs", flush=True)
     spark.sparkContext.cancelAllJobs()
-
-
-def _err(e):
-    if _STOPPED:
-        return f"stopped after {MAX_MINUTES} min (MAX_MINUTES)"
-    lines = [ln.strip() for ln in str(e).splitlines() if ln.strip() and not ln.strip().startswith("at ")]
-    return f"{type(e).__name__}: " + " | ".join(lines[:3])[:400]
-
-
-def _guard():
-    if _STOPPED:
-        raise TimeoutError(f"stopped after {MAX_MINUTES} min (MAX_MINUTES)")
-
-
-# ---------------------------------------------------------------------------
-# PART 1: the functions of the NOTES_C query, line by line
-# ---------------------------------------------------------------------------
-# Each entry: name -> SQL expression over one HNO_NOTE_TEXT line, written
-# exactly as in the NOTES_C query of CONFIG_NB.
-_XML = r"""concat('<E>', replace(replace(replace(replace(replace(
-             regexp_replace(upper(trim(NOTE_TEXT)), '[\\p{Cc}]', ''),
-             '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '"', '&quot;'), "'", '&apos;'),
-             char(13), '</E>')"""
-FUNCS = {
-    "NOTE_TEXT as read": "NOTE_TEXT",
-    "keep line: length(trim(NOTE_TEXT)) > 0": "CAST(length(trim(NOTE_TEXT)) > 0 AS STRING)",
-    "length(NOTE_TEXT)": "CAST(length(NOTE_TEXT) AS STRING)",
-    "trim(NOTE_TEXT)": "trim(NOTE_TEXT)",
-    "upper(NOTE_TEXT)": "upper(NOTE_TEXT)",
-    "upper(trim(NOTE_TEXT))": "upper(trim(NOTE_TEXT))",
-    "regexp_replace(upper(trim(..)), [\\p{Cc}], '')":
-        r"regexp_replace(upper(trim(NOTE_TEXT)), '[\\p{Cc}]', '')",
-    "regexp_replace(NOTE_TEXT, [\\p{Cc}], '') alone": r"regexp_replace(NOTE_TEXT, '[\\p{Cc}]', '')",
-    "XML piece (the whole expression)": _XML,
-    "CAST(CONTACT_DATE_REAL AS STRING)": "CAST(CONTACT_DATE_REAL AS STRING)",
-}
-
-
-def _part1():
-    t0 = time.time()
-    print(f"PART 1: the NOTES_C functions on lines of {LINES_TABLE}", flush=True)
-    _set_native(False)
-    files = sorted(spark.table(LINES_TABLE).inputFiles())
-    if not files:
-        print("   no files found; PART 1 skipped", flush=True)
-        return None
-    step = max(1, len(files) // FILES)
-    pick = files[::step][:FILES]                    # spread over the table
-    need = {c.lower() for c in LINE_KEYS + ["NOTE_TEXT", "CONTACT_DATE_REAL"]}
-    raw = spark.read.parquet(*pick)
-    if need <= {c.lower() for c in raw.columns}:
-        src, how = raw, "the parquet files directly"
-    else:                                           # column mapping: physical names differ
-        src = spark.table(LINES_TABLE).where(F.col("_metadata.file_path").isin(pick))
-        how = "the table, filtered to those files"
-    by_lower = {c.lower(): c for c in src.columns}
-    src = src.select(*[F.col(by_lower[c.lower()]).alias(c) for c in LINE_KEYS + ["NOTE_TEXT", "CONTACT_DATE_REAL"]])
-    types = {f.name: f.dataType for f in src.schema.fields}
-    total = src.count()
-    per = max(1, min(10000, MAX_LINES * 10000 // max(total, 1)))   # in 1/10000
-    sel = f"pmod(pmod({_int_expr('NOTE_CSN_ID', types['NOTE_CSN_ID'])}, 10007) * 31 + " \
-          f"pmod({_int_expr('LINE', types['LINE'])}, 10007), 10000) < {per}"
-    src.createOrReplaceTempView("__nd_lines")
-    print(f"   {len(pick)} of {len(files)} files, read through {how}: {total:,} lines; "
-          f"compared: about {per / 100:g}% of them", flush=True)
-
-    names = list(FUNCS)
-    keys = ", ".join(f"`{k}`" for k in LINE_KEYS)
-
-    def run(native):
-        _guard()
-        _set_native(native)
-        t = time.time()
-        hs = ", ".join(f"xxhash64(coalesce(CAST(({FUNCS[n]}) AS STRING), '')) AS h{i}"
-                       for i, n in enumerate(names))
-        df = spark.sql(f"SELECT {keys}, {hs}, xxhash64(concat('{_CTL}', CAST(CAST(LINE AS BIGINT) AS STRING))) AS ctl "
-                       f"FROM __nd_lines WHERE {sel}")
-        rows = df.collect()
-        p = _plan(df)
-        _set_native(False)
-        out = defaultdict(list)
-        for r in rows:
-            out[tuple(r[k] for k in LINE_KEYS)].append(r)
-        return out, len(rows), p, _mins(t)
-
-    rn, nn, pn, tn = run(True)
-    rv, nv, _, tv = run(False)
-    ops = _native_ops(pn)
-    print(f"   native: {nn:,} lines in {tn} | native operators {ops} | normal: {nv:,} lines in {tv}", flush=True)
-    if ops == 0:
-        print("   the native run had NO native operators, so PART 1 compares normal Spark with "
-              "itself and means nothing", flush=True)
-    paired = [k for k in rv if len(rv[k]) == 1 and len(rn.get(k, [])) == 1]
-    dup = sum(1 for k in rv if len(rv[k]) > 1) + sum(1 for k in rn if len(rn[k]) > 1)
-    only_v = sum(1 for k in rv if k not in rn)
-    only_n = sum(1 for k in rn if k not in rv)
-    ctl_bad = sum(1 for k in paired if rv[k][0]["ctl"] != rn[k][0]["ctl"])
-    print(f"   lines paired {len(paired):,} | only in normal {only_v:,} | only in native {only_n:,} | "
-          f"duplicate keys {dup:,}", flush=True)
-    print(f"   self-check: the engines hash the same fixed text differently in {ctl_bad:,} lines"
-          + (" (0 = same hash function, the counts below are exact)" if ctl_bad == 0 else
-             " (NOT 0: the counts below are not reliable)"), flush=True)
-    diff = {}
-    for i, n in enumerate(names):
-        ks = [k for k in paired if rv[k][0][f"h{i}"] != rn[k][0][f"h{i}"]]
-        diff[n] = ks
-        print(f"   {n:<46} {'SAME' if not ks else 'DIFFERENT'}"
-              + (f" in {len(ks):,} of {len(paired):,} lines" if ks else ""), flush=True)
-
-    # kinds: fetch the values of a few differing lines from both engines (small)
-    want = {n: ks[:MAX_ANALYSED] for n, ks in diff.items() if ks}
-    if want:
-        allk = sorted({k for ks in want.values() for k in ks}, key=str)
-        kschema = StructType([StructField(f"q{j}", types[c], True) for j, c in enumerate(LINE_KEYS)])
-        spark.createDataFrame(allk, kschema).createOrReplaceTempView("__nd_keys")
-        on = " AND ".join(f"l.`{c}` <=> k.q{j}" for j, c in enumerate(LINE_KEYS))
-        cols = ", ".join(f"CAST(({FUNCS[n]}) AS STRING) AS v{i}" for i, n in enumerate(names))
-        lk = ", ".join(f"l.`{k}`" for k in LINE_KEYS)
-
-        def values(native):
-            _guard()
-            _set_native(native)
-            got = spark.sql(f"SELECT /*+ BROADCAST(k) */ {lk}, {cols} FROM __nd_lines l "
-                            f"LEFT SEMI JOIN __nd_keys k ON {on}").collect()
-            _set_native(False)
-            return {tuple(r[k] for k in LINE_KEYS): r for r in got}
-
-        vn, vv = values(True), values(False)
-        print("   kinds of difference (normal = normal Spark, native = native engine; A = letter A-Z, "
-              "a = a-z, 9 = digit, _ = space, others by code):", flush=True)
-        for i, n in enumerate(names):
-            if n not in want:
-                continue
-            kinds, chars, lens = Counter(), Counter(), Counter()
-            looked = 0
-            for k in want[n]:
-                a, b = vv.get(k), vn.get(k)
-                if a is None or b is None:
-                    continue
-                looked += 1
-                x, y = a[f"v{i}"], b[f"v{i}"]
-                if x == y:
-                    kinds["Spark sees a difference, Python does not (bytes that are not valid UTF-8?)"] += 1
-                    continue
-                kinds[_kind(x, y, "number" if "CONTACT_DATE_REAL" in n else "string")] += 1
-                if x is not None and y is not None:
-                    d = len(y) - len(x)
-                    lens["0" if d == 0 else (f"{d:+d}" if abs(d) <= 3 else ("> +3" if d > 0 else "< -3"))] += 1
-                src_text = a["v0"] if "NOTE_TEXT" in n or "XML" in n else ""   # the line as normal Spark read it
-                for ch in set(src_text or ""):
-                    if ord(ch) > 126 or (ord(ch) < 32):
-                        chars[_char(ch)] += 1
-            print(f"   {n}: {looked} differing lines looked at", flush=True)
-            for k_, c in kinds.most_common(10):
-                print(f"      {c:>5}  {k_}", flush=True)
-            if len(kinds) > 10:
-                print(f"      ... and {len(kinds) - 10} more kinds", flush=True)
-            if lens:
-                print(f"      length, native minus normal: {dict(lens.most_common(6))}", flush=True)
-            if chars:
-                print("      special characters in these lines (code, name: in how many lines): "
-                      + "; ".join(f"{c_}: {cnt}" for c_, cnt in chars.most_common(8)), flush=True)
-    print(f"PART 1 done in {_mins(t0)}", flush=True)
-    return diff
-
-
-# ---------------------------------------------------------------------------
-# PART 2: the whole NOTES_C query, per output column, folded into buckets
-# ---------------------------------------------------------------------------
-def _part2():
-    t0 = time.time()
-    cfg = {c["pipeline_name"]: c for c in pipeline_configs}[PIPELINE]
-    q = cfg["source_query"]
-    spec = _sync_spec(cfg["target_table"], cfg.get("primary_keys", ""),
-                      cfg.get("non_key_columns", ""), cfg.get("identity_column"))
-    _set_native(False)
-    plain = spark.sql(q)                              # resolves names and types, runs nothing
-    by_lower = {c.lower(): c for c in plain.columns}
-    ftypes = {f.name: f.dataType for f in plain.schema.fields}
-    cols = [by_lower[c] for c in spec["allColsList"] if c != spec["identityLower"] and c in by_lower]
-    missing = [k for k in KEY_COLS if k.lower() not in by_lower]
-    if missing:
-        raise ValueError(f"KEY_COLS {missing} are not columns of the {PIPELINE} source query")
-    keys = [by_lower[k.lower()] for k in KEY_COLS]
-    # integer arithmetic only (no hash, no text), so both engines put a row in the same bucket
-    mult = [7919, 104729, 1299709]
-    bucket = " + ".join(f"pmod(coalesce({_int_expr(k, ftypes[k])}, 0), 1000003) * {mult[j % 3]}"
-                        for j, k in enumerate(keys))
-    bucket = f"pmod({bucket}, {BUCKETS})"
-    print(f"PART 2: {PIPELINE}, {len(cols)} columns, {BUCKETS:,} buckets", flush=True)
-
-    def fold(native):
-        _guard()
-        _set_native(native)
-        t = time.time()
-        df = spark.sql(q).selectExpr(
-            f"{bucket} AS __b",
-            *[f"xxhash64(coalesce(CAST(`{c}` AS STRING), '')) AS h{i}" for i, c in enumerate(cols)])
-        agg = df.groupBy("__b").agg(
-            F.count(F.lit(1)).alias("n"),
-            *[F.expr(f"bit_xor(h{i})").alias(f"x{i}") for i in range(len(cols))],
-            F.expr(f"xxhash64(concat('{_CTL}', CAST(__b AS STRING)))").alias("ctl"))
-        rows = agg.collect()
-        p = _plan(agg)
-        _set_native(False)
-        return {r["__b"]: r for r in rows}, sum(r["n"] for r in rows), p, _mins(t)
-
-    bn, nn, pn, tn = fold(True)
-    ops = _native_ops(pn)
-    casts_native = any("xxhash64(" in ln and "Transformer" in ln for ln in pn.splitlines())
-    print(f"   native engine: {nn:,} rows in {tn} | native operators {ops} | "
-          f"casts to string done by the native engine: {'yes' if casts_native else 'NO'}", flush=True)
-    bv, nv, _, tv = fold(False)
-    print(f"   normal Spark : {nv:,} rows in {tv}", flush=True)
-    both = [b for b in bv if b in bn]
-    cnt_bad = [b for b in both if bv[b]["n"] != bn[b]["n"]]
-    ctl_bad = sum(1 for b in both if bv[b]["ctl"] != bn[b]["ctl"])
-    print(f"   buckets: normal {len(bv):,}, native {len(bn):,}; with a different row count: "
-          f"{len(cnt_bad) + len(set(bv) ^ set(bn)):,}", flush=True)
-    print(f"   self-check: the engines hash the same fixed text differently in {ctl_bad:,} buckets"
-          + (" (0 = same hash function)" if ctl_bad == 0 else " (NOT 0: the result is not reliable)"),
-          flush=True)
-    same_n = [b for b in both if bv[b]["n"] == bn[b]["n"]]
-    print("   per output column (a bucket differs when any of its rows differs; rows estimated):", flush=True)
-    for i, c in enumerate(cols):
-        d = sum(1 for b in same_n if bv[b][f"x{i}"] != bn[b][f"x{i}"])
-        if d == 0:
-            print(f"   {c:<24} SAME", flush=True)
-            continue
-        f_ = d / max(len(same_n), 1)
-        est = "most rows" if f_ > 0.95 else f"about {-len(same_n) * math.log(1 - f_):,.0f} rows"
-        print(f"   {c:<24} DIFFERENT in {d:,} of {len(same_n):,} buckets ({est})", flush=True)
-    print(f"PART 2 done in {_mins(t0)}", flush=True)
 
 
 _timer = threading.Timer(MAX_MINUTES * 60, _watchdog)
 _timer.daemon = True
 _timer.start()
-print(f"CHECK_NATIVE_DIFF v3 {PIPELINE} | Spark {spark.version} | stops itself after {MAX_MINUTES} min",
-      flush=True)
-try:
+for name in _names:
+    cfg = _by_name[name]
+    if _STOPPED:
+        _results.append((name, None, 0, 0, 0))
+        print(f"{name}: not run (MAX_MINUTES reached)", flush=True)
+        continue
     try:
-        _part1()
+        fp_on, min_on, ops_on = _fingerprint(cfg, True)
+        fp_off, min_off, ops_off = _fingerprint(cfg, False)
+        same = fp_on == fp_off
+        _results.append((name, same, min_on, min_off, ops_on))
+        print(f"{name}: {'SAME' if same else 'DIFFERENT'} | rows {fp_on[0]:,} vs {fp_off[0]:,} | "
+              f"native {min_on:.1f} min vs normal {min_off:.1f} min | native operators {ops_on} vs {ops_off}",
+              flush=True)
+        if not same:
+            print(f"   native: {fp_on}\n   normal: {fp_off}", flush=True)
     except Exception as e:
-        print(f"PART 1 stopped: {_err(e)}", flush=True)
-        if _STOPPED:
-            raise
-    if RUN_PART_2:
-        _guard()
-        _part2()
-except Exception as e:
-    print(f"stopped: {_err(e)}", flush=True)
-finally:
-    _timer.cancel()
-    _set_native(False)
-    spark.catalog.clearCache()
-    print(f"done in {_mins(_T0)} (native left OFF)", flush=True)
-    if STOP_SESSION_AT_END:
-        print("stopping this Spark session now, so it does not keep using capacity", flush=True)
+        _results.append((name, None, 0, 0, 0))
+        print(f"{name}: ERROR {type(e).__name__}: {str(e)[:300]}", flush=True)
+_timer.cancel()
+spark.conf.set("spark.native.enabled", "true")
+
+_ok = [r for r in _results if r[1] is True]
+_bad = [r[0] for r in _results if r[1] is False]
+_err = [r[0] for r in _results if r[1] is None]
+print("=" * 70)
+print(f"SAME {len(_ok)} | DIFFERENT {len(_bad)} {_bad} | ERROR {len(_err)} {_err}")
+if _ok:
+    print(f"source queries: native {sum(r[2] for r in _ok):.1f} min vs normal {sum(r[3] for r in _ok):.1f} min "
+          f"(native ran first, so the normal runs had the warmer file cache)")
+if any(r[4] == 0 for r in _ok):
+    print("WARNING: some 'native' runs had no native operators, so the engine was not really on. "
+          "Check that cell 1 (%%configure) is the first cell and ran.")
+if STOP_SESSION_AT_END:
+    print("stopping this Spark session now, so it does not keep using capacity", flush=True)
+    try:
+        notebookutils.session.stop()
+    except NameError:
         try:
-            notebookutils.session.stop()
+            mssparkutils.session.stop()
         except NameError:
-            try:
-                mssparkutils.session.stop()
-            except NameError:
-                print("   (notebookutils not found: stop the session from the toolbar)", flush=True)
+            print("   (notebookutils not found: stop the session from the toolbar)", flush=True)
